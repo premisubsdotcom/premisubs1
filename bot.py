@@ -1,0 +1,1099 @@
+import os
+import json
+import asyncio
+import logging
+import traceback
+import re
+import imaplib
+import email
+import datetime
+import threading
+import sys
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from io import BytesIO
+from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    filters,
+)
+from telegram.helpers import escape_markdown
+from telegram.constants import ParseMode
+
+# Enable logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# --- Constants & Config ---
+load_dotenv()
+BOT_TOKEN      = os.getenv("BOT_TOKEN")
+OWNER_CHAT_ID  = int(os.getenv("OWNER_CHAT_ID"))
+ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID"))
+DB_FILE        = "db.json"
+
+# Conversation states for admin setup
+ADMIN_EMAIL, ADMIN_PASS = range(2)
+
+# Flow marker for user feature flows
+F_FLOW_FLAG = "flow"
+
+# Marker for specifying mails flow
+MAIL_FLOW_FLAG = "specify_mails_for"
+
+# Netflix IMAP constants
+IMAP_HOST = "imap.gmail.com"
+IMAP_PORT = 993
+
+# Thread lock for DB access
+db_lock = threading.Lock()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility: Database load/save with lock
+# ─────────────────────────────────────────────────────────────────────────────
+def load_db():
+    with db_lock:
+        if not Path(DB_FILE).exists():
+            initialize_db()
+        with open(DB_FILE, "r") as f:
+            return json.load(f)
+
+def save_db(data):
+    with db_lock:
+        with open(DB_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    # After any change to db.json, send the updated file to the owner
+    try:
+        loop = asyncio.get_event_loop()
+        coro = application.bot.send_document(
+            OWNER_CHAT_ID,
+            document=open(DB_FILE, "rb"),
+            filename=DB_FILE,
+            caption="Updated db.json"
+        )
+        loop.create_task(coro)
+    except Exception as e:
+        logger.error(f"Failed to send updated db.json to owner: {e}")
+
+def initialize_db():
+    data = {"credentials": [{"mail": "", "pass": "", "users": []}]}
+    save_db(data)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scheduler job: decrement days daily at midnight Asia/Kolkata
+# ─────────────────────────────────────────────────────────────────────────────
+def decrement_days_and_notify():
+    try:
+        data = load_db()
+        changed = False
+        to_notify = []
+        for cred in data["credentials"]:
+            for user in cred["users"]:
+                if user["days"] > 0:
+                    user["days"] -= 1
+                    changed = True
+                    if user["days"] == 0:
+                        to_notify.append(user["id"])
+        if changed:
+            save_db(data)
+        for uid in to_notify:
+            admin = application.bot.get_chat(ADMIN_CHAT_ID)
+            admin_username = f"@{admin.username}" if admin.username else ""
+            lines = ["Your approved days are complete so please contact your supplier to extend the days"]
+            if admin_username:
+                lines.append(f"supplier id: {admin_username}")
+            asyncio.run_coroutine_threadsafe(
+                application.bot.send_message(uid, "\n".join(lines)),
+                asyncio.get_event_loop()
+            )
+            user = application.bot.get_chat(uid)
+            mention = f"[{uid}](tg://user?id={uid})"
+            fullname = user.full_name
+            uname = f"@{user.username}" if user.username else ""
+            alert = ["Alert 🚨", mention, fullname]
+            if uname:
+                alert.append(uname)
+            alert.append("This user’s approval days have ended.")
+            asyncio.run_coroutine_threadsafe(
+                application.bot.send_message(
+                    ADMIN_CHAT_ID,
+                    "\n".join(alert),
+                    parse_mode="Markdown"
+                ),
+                asyncio.get_event_loop()
+            )
+    except Exception:
+        tb = traceback.format_exc()
+        bio = BytesIO(tb.encode("utf-8"))
+        bio.name = "error.txt"
+        asyncio.run_coroutine_threadsafe(
+            application.bot.send_document(
+                OWNER_CHAT_ID,
+                document=bio,
+                filename="error.txt",
+                caption="Error in scheduled decrement_days_and_notify"
+            ),
+            asyncio.get_event_loop()
+        )
+
+scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+scheduler.add_job(decrement_days_and_notify, "cron", hour=0, minute=0)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Error reporting
+# ─────────────────────────────────────────────────────────────────────────────
+async def report_error(context: ContextTypes.DEFAULT_TYPE, e: Exception):
+    tb = traceback.format_exc()
+    bio = BytesIO(tb.encode("utf-8"))
+    bio.name = "error.txt"
+    await context.bot.send_document(
+        OWNER_CHAT_ID,
+        document=bio,
+        filename="error.txt",
+        caption="❌ Error Occurred"
+    )
+    logger.error(tb)
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    await report_error(context, context.error)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMAP Helper: synchronous + async wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+def _connect_to_gmail(mail: str, pwd: str):
+    conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+    conn.login(mail, pwd)
+    return conn
+
+async def test_imap(mail: str, pwd: str) -> bool:
+    loop = asyncio.get_event_loop()
+    try:
+        c = await loop.run_in_executor(None, lambda: _connect_to_gmail(mail, pwd))
+        await loop.run_in_executor(None, c.logout)
+        return True
+    except:
+        return False
+
+def _search_last_hour(imap_conn, target_email: str):
+    imap_conn.select("INBOX")
+    raw_query = f'from:info@account.netflix.com to:{target_email} newer_than:1h'
+    status, data = imap_conn.search(None, "X-GM-RAW", f'"{raw_query}"')
+    if status != "OK":
+        return []
+    return data[0].split()
+
+def _filter_uids_last_15m(imap_conn, uids):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now - datetime.timedelta(minutes=15)
+    result = []
+    for uid in uids:
+        status, md = imap_conn.fetch(uid, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
+        if status != "OK":
+            continue
+        hdr = md[0][1].decode("utf-8", errors="ignore")
+        date_line = next((l for l in hdr.split("\r\n") if l.lower().startswith("date:")), None)
+        if not date_line:
+            continue
+        try:
+            dt = parsedate_to_datetime(date_line[len("Date:"):].strip())
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+        except:
+            continue
+        if cutoff <= dt <= now:
+            result.append(uid)
+    return result
+
+def _extract_household_links(imap_conn, uids):
+    pat = re.compile(r"https://www\.netflix\.com/(account/update-primary-location|account/travel/verify)\?[^\"'\]\s]+", re.IGNORECASE)
+    out = {}
+    for uid in uids:
+        status, md = imap_conn.fetch(uid, "(RFC822)")
+        if status != "OK":
+            out[uid.decode()] = None
+            continue
+        msg = email.message_from_bytes(md[0][1])
+        text = ""
+        if msg.is_multipart():
+            for p in msg.walk():
+                if p.get_content_type() in ("text/plain","text/html") and "attachment" not in str(p.get("Content-Disposition","")):
+                    try:
+                        pl = p.get_payload(decode=True)
+                        text += pl.decode(p.get_content_charset() or "utf-8", errors="replace")
+                    except:
+                        pass
+        else:
+            try:
+                pl = msg.get_payload(decode=True)
+                text = pl.decode(msg.get_content_charset() or "utf-8", errors="replace")
+            except:
+                text = ""
+        m = pat.search(text)
+        out[uid.decode()] = m.group(0).rstrip("]") if m else None
+    return out
+
+def _extract_signin_codes(imap_conn, uids):
+    pat = re.compile(r">[\s\r\n]*([0-9]{4})[\s\r\n]*<", re.IGNORECASE)
+    out = {}
+    for uid in uids:
+        status, md = imap_conn.fetch(uid, "(RFC822)")
+        if status != "OK":
+            out[uid.decode()] = None
+            continue
+        msg = email.message_from_bytes(md[0][1])
+        text = ""
+        if msg.is_multipart():
+            for p in msg.walk():
+                if p.get_content_type() in ("text/plain","text/html") and "attachment" not in str(p.get("Content-Disposition","")):
+                    try:
+                        pl = p.get_payload(decode=True)
+                        text += pl.decode(p.get_content_charset() or "utf-8", errors="replace")
+                    except:
+                        pass
+        else:
+            try:
+                pl = msg.get_payload(decode=True)
+                text = pl.decode(msg.get_content_charset() or "utf-8", errors="replace")
+            except:
+                text = ""
+        m = pat.search(text)
+        out[uid.decode()] = m.group(1) if m else None
+    return out
+
+def _extract_reset_links(imap_conn, uids):
+    pat = re.compile(r"https://www\.netflix\.com/password\?[^\"'\]\s]+", re.IGNORECASE)
+    out = {}
+    for uid in uids:
+        status, md = imap_conn.fetch(uid, "(RFC822)")
+        if status != "OK":
+            out[uid.decode()] = None
+            continue
+        msg = email.message_from_bytes(md[0][1])
+        text = ""
+        if msg.is_multipart():
+            for p in msg.walk():
+                if p.get_content_type() in ("text/plain","text/html") and "attachment" not in str(p.get("Content-Disposition","")):
+                    try:
+                        pl = p.get_payload(decode=True)
+                        text += pl.decode(p.get_content_charset() or "utf-8", errors="replace")
+                    except:
+                        pass
+        else:
+            try:
+                pl = msg.get_payload(decode=True)
+                text = pl.decode(msg.get_content_charset() or "utf-8", errors="replace")
+            except:
+                text = ""
+        m = pat.search(text)
+        out[uid.decode()] = m.group(0).rstrip("]") if m else None
+    return out
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI Builders
+# ─────────────────────────────────────────────────────────────────────────────
+def build_access_markup(chat_id: int):
+    data = load_db()
+    usr = next((u for u in data["credentials"][0]["users"] if u["id"] == chat_id), None)
+    if not usr:
+        return None
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📍 Household {'✅' if usr['household'] else '❌'}", callback_data=f"toggle_household:{chat_id}")],
+        [InlineKeyboardButton(f"🔑 Sign-in Code {'✅' if usr['signin'] else '❌'}", callback_data=f"toggle_signin:{chat_id}")],
+        [InlineKeyboardButton(f"🛡️ Password Reset {'✅' if usr['reset'] else '❌'}", callback_data=f"toggle_reset:{chat_id}")],
+        [InlineKeyboardButton("Disapprove", callback_data=f"disapprove_cb:{chat_id}")]
+    ])
+
+def build_mail_choice_markup(chat_id: int, days: int):
+    return InlineKeyboardMarkup.from_row([
+        InlineKeyboardButton("Set all mails", callback_data=f"set_all_mails:{chat_id}"),
+        InlineKeyboardButton("Set specified mails", callback_data=f"set_specified_mails:{chat_id}")
+    ])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Handlers
+# ─────────────────────────────────────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    if chat_id == ADMIN_CHAT_ID:
+        data = load_db()
+        mail = data["credentials"][0]["mail"]
+        pwd  = data["credentials"][0]["pass"]
+        if not mail or not pwd:
+            kb = InlineKeyboardMarkup.from_button(InlineKeyboardButton("Configure this bot", callback_data="cfg_start"))
+            await update.message.reply_text(f"Hey {user.full_name}, this bot is not configured yet. Please click below to configure.", reply_markup=kb)
+            return ADMIN_EMAIL
+        temp = await update.message.reply_text("Checking your details...")
+        if await test_imap(mail, pwd):
+            kb = InlineKeyboardMarkup.from_button(InlineKeyboardButton("Reconfigure", callback_data="cfg_clear"))
+            await temp.edit_text(f"Hey {user.full_name}, you are the captain\nYou already configured this bot.", reply_markup=kb)
+        else:
+            initialize_db()
+            kb = InlineKeyboardMarkup.from_button(InlineKeyboardButton("Configure this bot", callback_data="cfg_start"))
+            await temp.edit_text(f"Hey {user.full_name}, this bot is not configured yet. Please click below to configure.", reply_markup=kb)
+            return ADMIN_EMAIL
+        return
+
+    data = load_db()
+    usr = next((u for u in data["credentials"][0]["users"] if u["id"] == chat_id), None)
+    if not usr or usr["days"] <= 0:
+        admin = await context.bot.get_chat(ADMIN_CHAT_ID)
+        admin_username = f"@{admin.username}" if admin.username else ""
+        text = f"Hey {user.full_name}, you are not approved to use this bot.\nSend /request to ask for access to your Netflix supplier/seller."
+        if admin_username:
+            text += f"\nSupplier id: {admin_username}"
+        return await update.message.reply_text(text)
+
+    await fetch_cmd(update, context)
+
+async def fetch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    data = load_db()
+    usr = next((u for u in data["credentials"][0]["users"] if u["id"] == chat_id), None)
+
+    if not usr or usr["days"] <= 0:
+        user = update.effective_user
+        admin = await context.bot.get_chat(ADMIN_CHAT_ID)
+        admin_username = f"@{admin.username}" if admin.username else ""
+        text = f"Hey {user.full_name}, you are not approved to use this bot.\nSend /request to ask for access to your Netflix supplier/seller."
+        if admin_username:
+            text += f"\nSupplier id: {admin_username}"
+        return await update.message.reply_text(text)
+
+    buttons = []
+    if usr.get("household"):
+        buttons.append(InlineKeyboardButton("Household Mail 📍", callback_data="fh"))
+    if usr.get("signin"):
+        buttons.append(InlineKeyboardButton("Sign-in Code 🔑", callback_data="fs"))
+    if usr.get("reset"):
+        buttons.append(InlineKeyboardButton("Password Reset 🛡️", callback_data="fr"))
+
+    if not buttons:
+        return await update.message.reply_text("You have no features enabled. Contact your admin.")
+
+    kb = InlineKeyboardMarkup.from_row(buttons)
+    await update.message.reply_text(f"Hey {update.effective_user.full_name}, which Netflix mail would you like to retrieve?", reply_markup=kb)
+
+async def request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id == ADMIN_CHAT_ID:
+        return await update.message.reply_text("Admins cannot use /request.")
+    user = update.effective_user
+    data = load_db()
+    creds = data["credentials"][0]
+    uid = update.effective_chat.id
+    user_rec = next((u for u in creds["users"] if u["id"] == uid), None)
+    if user_rec and user_rec["days"] > 0:
+        return await update.message.reply_text("You are already approved.")
+
+    await update.message.reply_text("Request sent to admin.")
+
+    admin = await context.bot.get_chat(ADMIN_CHAT_ID)
+    safe_admin_name = escape_markdown(admin.full_name, version=2)
+    safe_user_name  = escape_markdown(user.full_name,  version=2)
+    safe_username   = escape_markdown(f"@{user.username}", version=2) if user.username else ""
+    user_link       = f"[{uid}](tg://user?id={uid})"
+
+    msg = (
+        f"Hey {safe_admin_name},\n"
+        "Some user requested approval:\n\n"
+        f"• Chat ID: {user_link}\n"
+        f"• Full name: {safe_user_name}\n"
+        f"• Username: {safe_username}"
+    )
+
+    await context.bot.send_message(
+        ADMIN_CHAT_ID,
+        msg,
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return await update.message.reply_text("You are not authorized.")
+    try:
+        _, target_s = update.message.text.split()
+        target_id = int(target_s)
+    except:
+        return await update.message.reply_text("Usage: /status <chat_id>")
+    data = load_db()
+    usr = next((u for u in data["credentials"][0]["users"] if u["id"] == target_id), None)
+    if not usr or usr["days"] <= 0:
+        return await update.message.reply_text(f"User {target_id} is not approved.")
+    mails = usr.get("mails", [])
+    mail_type = "ALL mails" if mails == ["ALL"] else "SPECIFIED mails"
+    text = f"{target_id} has {usr['days']} days left. This user is set to {mail_type} and has access to:"
+    buttons = []
+    buttons.append([InlineKeyboardButton(f"📍 Household {'✅' if usr['household'] else '❌'}", callback_data=f"toggle_household:{target_id}")])
+    buttons.append([InlineKeyboardButton(f"🔑 Sign-in Code {'✅' if usr['signin'] else '❌'}", callback_data=f"toggle_signin:{target_id}")])
+    buttons.append([InlineKeyboardButton(f"🛡️ Password Reset {'✅' if usr['reset'] else '❌'}", callback_data=f"toggle_reset:{target_id}")])
+    if mails != ["ALL"]:
+        buttons.append([InlineKeyboardButton("See specified mails", callback_data=f"see_specified_mails:{target_id}")])
+    buttons.append([InlineKeyboardButton("Disapprove mails", callback_data=f"disapprove_cb:{target_id}")])
+    kb = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(text, reply_markup=kb)
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return await update.message.reply_text("You are not authorized to use /users.")
+    data = load_db()
+    users = data["credentials"][0]["users"]
+    bio = BytesIO(json.dumps(users, indent=2).encode("utf-8"))
+    bio.name = "users.json"
+    await context.bot.send_document(chat_id=ADMIN_CHAT_ID, document=bio, filename="users.json")
+
+async def terminate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return await update.message.reply_text("You are not authorized to use /terminate.")
+    data = load_db()
+    data["credentials"][0]["users"] = []
+    save_db(data)
+    await update.message.reply_text("All users have been disapproved.")
+
+async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Contact @NoonXD for support")
+
+async def commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id == ADMIN_CHAT_ID:
+        msg = (
+            "Admin commands:\n"
+            "  /approve <chat_id> <days>   – Approve a user for <days> days\n"
+            "  /extend <chat_id> <days>    – Extend a user's remaining days by <days>\n"
+            "  /disapprove <chat_id>       – Disapprove (remove) a user immediately\n"
+            "  /status <chat_id>           – Show that user's days left and access toggles\n"
+            "  /users                      – Download JSON of all approved users\n"
+            "  /info <email>               – Show which users are linked to an email\n"
+            "  /mail                       – Clear IMAP credentials and reconfigure\n"
+            "  /terminate                  – Disapprove all users (clear users list)\n"
+            "  /reconfigure                – Factory reset the bot (delete all data)\n"
+            "  /commands                   – Show this list of admin commands\n"
+        )
+    else:
+        msg = (
+            "User commands:\n"
+            "  /fetch      – Start retrieving Netflix mail\n"
+            "  /request    – Request approval from the admin\n"
+            "  /status     – Show your remaining days (or approval status)\n"
+            "  /support    – Get support contact info\n"
+            "  /commands   – Show this list of user commands\n"
+            "\n"
+            "Plus, if approved and you have features enabled:\n"
+            "  • Tap one of the inline buttons (Household / Sign-in Code / Password Reset)\n"
+            "    to start retrieving your Netflix mail info.\n"
+        )
+    await update.message.reply_text(msg)
+
+async def mail_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return await update.message.reply_text("Not authorized.")
+    data = load_db()
+    data["credentials"][0]["mail"] = ""
+    data["credentials"][0]["pass"] = ""
+    save_db(data)
+    await update.message.reply_text("IMAP credentials cleared. Please send me your Gmail address to configure the bot.")
+    return ADMIN_EMAIL
+
+async def reconfigure_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return await update.message.reply_text("Not authorized.")
+    initialize_db()
+    await update.message.reply_text("Factory reset complete.\nPlease send me your Gmail address to configure the bot.")
+    return ADMIN_EMAIL
+
+async def cfg_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return ConversationHandler.END
+    await update.callback_query.answer()
+    await update.callback_query.message.reply_text("Please send me your Gmail address.")
+    return ADMIN_EMAIL
+
+async def cfg_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return ConversationHandler.END
+    data = load_db()
+    data["credentials"][0]["mail"] = ""
+    data["credentials"][0]["pass"] = ""
+    save_db(data)
+    await update.callback_query.answer()
+    await update.callback_query.message.reply_text("IMAP cleared. Please send me your Gmail address.")
+    return ADMIN_EMAIL
+
+async def admin_email_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return ConversationHandler.END
+    text = update.message.text.strip()
+    if not text.lower().endswith("@gmail.com"):
+        await update.message.reply_text("That’s not a Gmail address.")
+        return ADMIN_EMAIL
+    context.user_data["admin_mail"] = text
+    kb = InlineKeyboardMarkup.from_row([
+        InlineKeyboardButton("How to get app password", url="https://telegra.ph/How-to-get-my-App-Password-05-29"),
+        InlineKeyboardButton("Wrong mail", callback_data="cfg_start"),
+    ])
+    await update.message.reply_text("Now send me your app password.", reply_markup=kb)
+    return ADMIN_PASS
+
+async def admin_pass_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return ConversationHandler.END
+    pwd = update.message.text.strip()
+    mail = context.user_data["admin_mail"]
+    temp = await update.message.reply_text("Connecting to your IMAP…")
+    if not await test_imap(mail, pwd):
+        return await temp.edit_text("Failed to connect; please retry.")
+    data = load_db()
+    data["credentials"][0]["mail"] = mail
+    data["credentials"][0]["pass"] = pwd
+    save_db(data)
+    kb = InlineKeyboardMarkup.from_button(InlineKeyboardButton("Commands", url="https://telegra.ph/Netflix-Bot-Help-Menu-05-31"))
+    await temp.edit_text("Successfully connected.")
+    await update.message.reply_text("All set!", reply_markup=kb)
+    return ConversationHandler.END
+
+async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return await update.message.reply_text("Not authorized.")
+    try:
+        _, chat_id_s, days_s = update.message.text.split()
+        chat_id, days = int(chat_id_s), int(days_s)
+    except:
+        return await update.message.reply_text("Usage: /approve <chat_id> <days>")
+    data = load_db()
+    users = data["credentials"][0]["users"]
+    usr = next((u for u in users if u["id"] == chat_id), None)
+    if usr:
+        if usr["days"] > 0:
+            return await update.message.reply_text(f"{chat_id} already approved for {usr['days']} days.")
+        usr["days"] = days
+        usr.setdefault("mails", [])
+    else:
+        users.append({"id": chat_id, "days": days, "household": True, "signin": False, "reset": False, "mails": []})
+    save_db(data)
+    mail_choice_markup = build_mail_choice_markup(chat_id, days)
+    await update.message.reply_text(f"Approved {chat_id} for {days} days.", reply_markup=mail_choice_markup)
+
+async def handle_set_all_mails_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return
+    _, chat_id_str = update.callback_query.data.split(":",1)
+    chat_id = int(chat_id_str)
+    data = load_db()
+    usr = next((u for u in data["credentials"][0]["users"] if u["id"] == chat_id), None)
+    if not usr:
+        return await update.callback_query.message.reply_text("User not found.")
+    usr["mails"] = ["ALL"]
+    save_db(data)
+    markup = build_access_markup(chat_id)
+    await update.callback_query.message.reply_text(f"Approved {chat_id} for {usr['days']} days for all mails.", reply_markup=markup)
+
+async def handle_set_specified_mails_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return
+    _, chat_id_str = update.callback_query.data.split(":", 1)
+    chat_id = int(chat_id_str)
+    context.user_data[MAIL_FLOW_FLAG] = chat_id
+    kb = InlineKeyboardMarkup.from_button(
+        InlineKeyboardButton("Go Back ⏎", callback_data=f"cancel_specify:{chat_id}")
+    )
+    await update.callback_query.message.reply_text(
+        "Send mails to set mails (one per line). Invalid lines ignored.\n\n"
+        "Example:\n"
+        "`example@gmail.com`\n"
+        "`exampl@domain.in`\n"
+        "`exampl@anything.in`",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+
+async def handle_cancel_specify_mails(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return
+    _, chat_id_str = update.callback_query.data.split(":",1)
+    chat_id = int(chat_id_str)
+    days = next((u["days"] for u in load_db()["credentials"][0]["users"] if u["id"] == chat_id), 0)
+    mail_choice_markup = build_mail_choice_markup(chat_id, days)
+    await update.callback_query.message.reply_text(f"Approved {chat_id} for {days} days.", reply_markup=mail_choice_markup)
+    context.user_data.pop(MAIL_FLOW_FLAG, None)
+
+async def extend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return await update.message.reply_text("Not authorized.")
+    try:
+        _, chat_id_s, days_s = update.message.text.split()
+        chat_id, days = int(chat_id_s), int(days_s)
+    except:
+        return await update.message.reply_text("Usage: /extend <chat_id> <days>")
+    data = load_db()
+    usr = next((u for u in data["credentials"][0]["users"] if u["id"] == chat_id), None)
+    if not usr:
+        return await update.message.reply_text(f"{chat_id} is not approved.")
+    usr["days"] += days
+    usr.setdefault("mails", [])
+    save_db(data)
+    markup = build_access_markup(chat_id)
+    await update.message.reply_text(f"Extended {chat_id}: now {usr['days']} days left.\nThis user has access to:", reply_markup=markup)
+
+async def disapprove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return await update.message.reply_text("Not authorized.")
+    try:
+        _, chat_id_s = update.message.text.split()
+        chat_id = int(chat_id_s)
+    except:
+        return await update.message.reply_text("Usage: /disapprove <chat_id>")
+    data = load_db()
+    new = [u for u in data["credentials"][0]["users"] if u["id"] != chat_id]
+    if len(new) == len(data["credentials"][0]["users"]):
+        return await update.message.reply_text(f"{chat_id} is not approved.")
+    data["credentials"][0]["users"] = new
+    save_db(data)
+    await update.message.reply_text(f"Removed approval for {chat_id}.")
+
+async def toggle_feature_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return
+    action, chat_id_str = update.callback_query.data.split(":",1)
+    chat_id = int(chat_id_str)
+    data = load_db()
+    usr = next((u for u in data["credentials"][0]["users"] if u["id"] == chat_id), None)
+    if action == "disapprove_cb":
+        data["credentials"][0]["users"] = [u for u in data["credentials"][0]["users"] if u["id"] != chat_id]
+        save_db(data)
+        return await update.callback_query.message.edit_text(f"User {chat_id} disapproved.")
+    if not usr:
+        return await update.callback_query.answer("User not found.")
+    if action == "toggle_household":
+        usr["household"] = not usr["household"]
+    elif action == "toggle_signin":
+        usr["signin"] = not usr["signin"]
+    elif action == "toggle_reset":
+        usr["reset"] = not usr["reset"]
+    save_db(data)
+    markup = build_access_markup(chat_id)
+    await update.callback_query.message.edit_text(f"Access settings for {chat_id}:", reply_markup=markup)
+
+async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return await update.message.reply_text("You are not authorized.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /info <email>")
+    email_arg = context.args[0].strip().lower()
+    data = load_db()
+    linked = [
+        u["id"]
+        for u in data["credentials"][0]["users"]
+        if u.get("mails") == ["ALL"]
+           or email_arg in [m.lower() for m in u.get("mails",[])]
+    ]
+    if not linked:
+        return await update.message.reply_text(f"{email_arg} is not linked to any user.")
+    result = {email_arg: linked}
+    bio = BytesIO(json.dumps(result, indent=2).encode("utf-8"))
+    bio.name = f"{email_arg.replace('@','_at_')}.json"
+    kb = InlineKeyboardMarkup.from_column([
+        InlineKeyboardButton("Unlink all users linked to this email", callback_data=f"unlink_all_email:{email_arg}"),
+        InlineKeyboardButton("Go Back", callback_data="info_go_back")
+    ])
+    await context.bot.send_document(
+        chat_id=ADMIN_CHAT_ID,
+        document=bio,
+        filename=bio.name,
+        caption=f"{email_arg} is linked with {len(linked)} user(s); open JSON to see them.",
+        reply_markup=kb
+    )
+
+async def handle_unlink_all_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return
+    _, email_arg = update.callback_query.data.split(":", 1)
+    email_arg = email_arg.lower()
+    data = load_db()
+    changed = False
+    for u in data["credentials"][0]["users"]:
+        if u.get("mails") != ["ALL"]:
+            before = len(u["mails"])
+            u["mails"] = [m for m in u["mails"] if m.lower() != email_arg]
+            if len(u["mails"]) != before:
+                changed = True
+    if changed:
+        save_db(data)
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"✅ Unlinked {email_arg} from all users.")
+    else:
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"ℹ️ No user had {email_arg} linked.")
+
+async def handle_info_go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.callback_query.message.reply_text("Cancelled.")
+
+async def handle_see_specified_mails(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return
+    _, chat_id_str = update.callback_query.data.split(":", 1)
+    chat_id = int(chat_id_str)
+    data = load_db()
+    usr = next((u for u in data["credentials"][0]["users"] if u["id"] == chat_id), None)
+    mails = usr.get("mails", [])
+    bio = BytesIO(json.dumps({str(chat_id): mails}, indent=2).encode("utf-8"))
+    bio.name = f"{chat_id}.json"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Unlink mails linked to this user", callback_data=f"unlink_mail_user_cb:{chat_id}")],
+        [InlineKeyboardButton("Link new mails to this user",      callback_data=f"link_mail_user_cb:{chat_id}")],
+        [InlineKeyboardButton("Cancel",                            callback_data="cancel_cb")],
+    ])
+    await context.bot.send_document(
+        chat_id=ADMIN_CHAT_ID,
+        document=bio,
+        filename=bio.name,
+        caption=f"User {chat_id} is linked with these mails:",
+        reply_markup=kb
+    )
+
+async def cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="Operation cancelled.")
+
+async def unlink_mail_user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    _, chat_id_str = update.callback_query.data.split(":", 1)
+    context.user_data["unlink_for"] = int(chat_id_str)
+    await update.callback_query.message.reply_text("Send the mails to unlink (one per line):")
+
+async def link_mail_user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    _, chat_id_str = update.callback_query.data.split(":", 1)
+    context.user_data["link_for"] = int(chat_id_str)
+    await update.callback_query.message.reply_text("Send the mails to link (one per line):")
+
+async def handle_fh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id == ADMIN_CHAT_ID:
+        return await update.callback_query.answer("Admins cannot fetch Netflix mails.")
+    await update.callback_query.answer()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Go Back ⏎", callback_data="go_back")]])
+    await update.callback_query.message.edit_text(f"Okay {update.effective_user.full_name}, send me your Netflix email to retrieve household mail.", reply_markup=kb)
+    context.user_data[F_FLOW_FLAG] = "fh"
+
+async def handle_fs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id == ADMIN_CHAT_ID:
+        return await update.callback_query.answer("Admins cannot fetch Netflix mails.")
+    await update.callback_query.answer()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Go Back ⏎", callback_data="go_back")]])
+    await update.callback_query.message.edit_text(f"Okay {update.effective_user.full_name}, send me your Netflix email to retrieve sign-in code.", reply_markup=kb)
+    context.user_data[F_FLOW_FLAG] = "fs"
+
+async def handle_fr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id == ADMIN_CHAT_ID:
+        return await update.callback_query.answer("Admins cannot fetch Netflix mails.")
+    await update.callback_query.answer()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Go Back ⏎", callback_data="go_back")]])
+    await update.callback_query.message.edit_text(f"Okay {update.effective_user.full_name}, send me your Netflix email to retrieve password reset link.", reply_markup=kb)
+    context.user_data[F_FLOW_FLAG] = "fr"
+
+async def handle_go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id == ADMIN_CHAT_ID:
+        return await update.callback_query.answer("Admins cannot fetch Netflix mails.")
+    await update.callback_query.answer()
+    data = load_db()
+    usr = next((u for u in data["credentials"][0]["users"] if u["id"]==update.effective_user.id), None)
+    if not usr:
+        return
+    buttons = []
+    if usr.get("household"):
+        buttons.append(InlineKeyboardButton("Household Mail 📍", callback_data="fh"))
+    if usr.get("signin"):
+        buttons.append(InlineKeyboardButton("Sign-in Code 🔑", callback_data="fs"))
+    if usr.get("reset"):
+        buttons.append(InlineKeyboardButton("Password Reset 🛡️", callback_data="fr"))
+    if not buttons:
+        await update.callback_query.message.edit_text(f"Hey {update.effective_user.full_name}, you have no features enabled.")
+        context.user_data.pop(F_FLOW_FLAG, None)
+        return
+    kb = InlineKeyboardMarkup.from_row(buttons)
+    await update.callback_query.message.edit_text(f"Hey {update.effective_user.full_name}, which Netflix mail would you like to retrieve?", reply_markup=kb)
+    context.user_data.pop(F_FLOW_FLAG, None)
+
+async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Don’t run for admin
+    if update.effective_chat.id == ADMIN_CHAT_ID:
+        return
+
+    # Safely handle missing user_data
+    user_data = context.user_data or {}
+
+    # If specifying mails flow, skip
+    if MAIL_FLOW_FLAG in user_data:
+        return
+
+    # Pop the feature flow marker
+    flow = user_data.pop(F_FLOW_FLAG, None)
+
+    # If there’s no active flow, ignore
+    if not flow:
+        return await update.message.reply_text("Unrecognized message. To retrieve Netflix mail, send /fetch")
+
+    # Validate the email address
+    email_addr = update.message.text.strip()
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_addr):
+        return await update.message.reply_text("Please send a valid email address, or send /fetch to start over.")
+
+    # Check permissions
+    data = load_db()
+    usr = next((u for u in data["credentials"][0]["users"] if u["id"] == update.effective_chat.id), None)
+    allowed = usr.get("mails", [])
+    if allowed and allowed != ["ALL"] and email_addr.lower() not in [m.lower() for m in allowed]:
+        return await update.message.reply_text(f"Unauthorized email: {email_addr}. Please use one of your approved emails.")
+
+    # Begin fetching
+    temp = await update.message.reply_text(
+        f"Fetching Netflix {'household mail' if flow=='fh' else 'sign-in code' if flow=='fs' else 'password reset link'} for {email_addr}..."
+    )
+    mail, pwd = data["credentials"][0]["mail"], data["credentials"][0]["pass"]
+    loop = asyncio.get_event_loop()
+    imap_conn = None
+
+    try:
+        imap_conn = await loop.run_in_executor(None, lambda: _connect_to_gmail(mail, pwd))
+        uids_hour = await loop.run_in_executor(None, lambda: _search_last_hour(imap_conn, email_addr))
+        if not uids_hour:
+            return await temp.edit_text(f"No Netflix emails in the last hour for {email_addr}.")
+        uids_15m = await loop.run_in_executor(None, lambda: _filter_uids_last_15m(imap_conn, uids_hour))
+        if not uids_15m:
+            return await temp.edit_text(f"No Netflix emails in the last 15 minutes for {email_addr}.")
+        await temp.delete()
+
+        if flow == "fh":
+            results = await loop.run_in_executor(None, lambda: _extract_household_links(imap_conn, uids_15m))
+            links = [l for l in results.values() if l]
+            if not links:
+                await update.message.reply_text("No household links found in the last 15 minutes.")
+            else:
+                for link in links:
+                    await update.message.reply_text(
+                        f"📧 Received from: info@account.netflix.com\n"
+                        f"➤ Received to: {email_addr}\n"
+                        f"🔗 Household link: {link}"
+                    )
+            feature = "household link"
+
+        elif flow == "fs":
+            results = await loop.run_in_executor(None, lambda: _extract_signin_codes(imap_conn, uids_15m))
+            codes = [c for c in results.values() if c]
+            if not codes:
+                await update.message.reply_text("No sign-in codes found in the last 15 minutes.")
+            else:
+                for code in codes:
+                    await update.message.reply_text(
+                        f"📧 Received from: info@account.netflix.com\n"
+                        f"➤ Received to: {email_addr}\n"
+                        f"🔑 Sign-in code: `{code}`",
+                        parse_mode="Markdown"
+                    )
+            feature = "sign-in code"
+
+        else:
+            results = await loop.run_in_executor(None, lambda: _extract_reset_links(imap_conn, uids_15m))
+            links = [l for l in results.values() if l]
+            if not links:
+                await update.message.reply_text("No password reset links found in the last 15 minutes.")
+            else:
+                for link in links:
+                    await update.message.reply_text(
+                        f"📧 Received from: info@account.netflix.com\n"
+                        f"➤ Received to: {email_addr}\n"
+                        f"🛡️ Reset link: {link}"
+                    )
+            feature = "password reset link"
+
+    except Exception as e:
+        logger.error(f"Error during IMAP fetch: {e}")
+        await temp.edit_text("Error occurred while fetching emails.")
+    finally:
+        if imap_conn:
+            try:
+                await loop.run_in_executor(None, imap_conn.logout)
+            except:
+                pass
+
+    # Notify admin
+    user = update.effective_user
+    mention = f"[{user.id}](tg://user?id={user.id})"
+    fullname = user.full_name
+    uname = f"@{user.username}" if user.username else ""
+    lines = ["Alert 🚨", mention, fullname]
+    if uname:
+        lines.append(uname)
+    lines.append(f"this user requested {feature} and it was sent successfully.")
+    lines.append(f"mail: {email_addr}")
+    alert_text = "\n".join(lines)
+    kb = InlineKeyboardMarkup.from_button(
+        InlineKeyboardButton("Disapprove this user", callback_data=f"disapprove_cb:{user.id}")
+    )
+    await context.bot.send_message(
+        ADMIN_CHAT_ID,
+        alert_text,
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return
+    # 1) Specifying mails for a user
+    if MAIL_FLOW_FLAG in context.user_data:
+        chat_id = context.user_data.pop(MAIL_FLOW_FLAG)
+        lines = [l.strip() for l in update.message.text.splitlines()]
+        valid, invalid = [], []
+        email_re = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+        for l in lines:
+            if email_re.match(l):
+                valid.append(l)
+            elif l:
+                invalid.append(l)
+        if not valid:
+            return await update.message.reply_text("No valid email addresses detected. Please send valid emails one per line.")
+        data = load_db()
+        usr = next((u for u in data["credentials"][0]["users"] if u["id"] == chat_id), None)
+        if not usr:
+            return await update.message.reply_text("User not found.")
+        usr["mails"] = valid
+        save_db(data)
+        markup = build_access_markup(chat_id)
+        msg = f"Approved {chat_id} for {usr['days']} days for specified mails."
+        if invalid:
+            msg += f"\nIgnored invalid lines: {', '.join(invalid)}"
+        return await update.message.reply_text(msg, reply_markup=markup)
+
+    # 2) Unlinking mails
+    if "unlink_for" in context.user_data:
+        chat_id = context.user_data.pop("unlink_for")
+        lines = [l.strip() for l in update.message.text.splitlines() if l.strip()]
+        data = load_db()
+        usr = next((u for u in data["credentials"][0]["users"] if u["id"] == chat_id), None)
+        removed, skipped = [], []
+        for mail in lines:
+            if usr and mail in usr.get("mails", []):
+                usr["mails"].remove(mail)
+                removed.append(mail)
+            else:
+                skipped.append(mail)
+        save_db(data)
+        return await update.message.reply_text(f"Unlinked: {removed}\nSkipped: {skipped}")
+
+    # 3) Linking new mails
+    if "link_for" in context.user_data:
+        chat_id = context.user_data.pop("link_for")
+        lines = [l.strip() for l in update.message.text.splitlines() if l.strip()]
+        email_re = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+        valid, invalid = [], []
+        for l in lines:
+            if email_re.match(l):
+                valid.append(l)
+            else:
+                invalid.append(l)
+        data = load_db()
+        usr = next((u for u in data["credentials"][0]["users"] if u["id"] == chat_id), None)
+        added = []
+        for mail in valid:
+            if usr and mail not in usr.get("mails", []):
+                usr.setdefault("mails", []).append(mail)
+                added.append(mail)
+        save_db(data)
+        msg = f"Linked new mails: {added}"
+        if invalid:
+            msg += f"\nSkipped invalid entries: {invalid}"
+        return await update.message.reply_text(msg)
+
+if __name__ == "__main__":
+    if not Path(DB_FILE).exists():
+        initialize_db()
+
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    scheduler.start()
+
+    cfg_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(cfg_start_cb, pattern="^cfg_start$"),
+            CallbackQueryHandler(cfg_clear_cb, pattern="^cfg_clear$"),
+            CommandHandler("reconfigure", reconfigure_handler),
+        ],
+        states={
+            ADMIN_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_email_received)],
+            ADMIN_PASS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_pass_received),
+                CallbackQueryHandler(cfg_start_cb, pattern="^cfg_start$")
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(cfg_clear_cb, pattern="^cfg_clear$")],
+        allow_reentry=True,
+    )
+    application.add_handler(cfg_conv)
+
+    application.add_handler(CommandHandler("mail", mail_cmd))
+    application.add_handler(CommandHandler("fetch", fetch_cmd))
+    application.add_handler(CommandHandler("request", request_handler))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("users", list_users))
+    application.add_handler(CommandHandler("approve", approve))
+    application.add_handler(CommandHandler("extend", extend))
+    application.add_handler(CommandHandler("disapprove", disapprove))
+    application.add_handler(CommandHandler("terminate", terminate))
+    application.add_handler(CommandHandler("support", support))
+    application.add_handler(CommandHandler("commands", commands))
+    application.add_handler(CommandHandler("info", info_cmd))
+
+    application.add_handler(CallbackQueryHandler(toggle_feature_cb, pattern=r"^(toggle_household|toggle_signin|toggle_reset|disapprove_cb):"))
+    application.add_handler(CallbackQueryHandler(handle_set_all_mails_cb, pattern="^set_all_mails:\\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_set_specified_mails_cb, pattern="^set_specified_mails:\\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_cancel_specify_mails, pattern="^cancel_specify:\\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_unlink_all_email, pattern="^unlink_all_email:"))
+    application.add_handler(CallbackQueryHandler(handle_info_go_back, pattern="^info_go_back$"))
+    application.add_handler(CallbackQueryHandler(handle_see_specified_mails, pattern="^see_specified_mails:\\d+$"))
+    application.add_handler(CallbackQueryHandler(cancel_cb, pattern="^cancel_cb$"))
+    application.add_handler(CallbackQueryHandler(unlink_mail_user_cb, pattern="^unlink_mail_user_cb:\\d+$"))
+    application.add_handler(CallbackQueryHandler(link_mail_user_cb, pattern="^link_mail_user_cb:\\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_fh, pattern="^fh$"))
+    application.add_handler(CallbackQueryHandler(handle_fs, pattern="^fs$"))
+    application.add_handler(CallbackQueryHandler(handle_fr, pattern="^fr$"))
+    application.add_handler(CallbackQueryHandler(handle_go_back, pattern="^go_back$"))
+
+    # Unified admin text handler for mails
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.Chat(ADMIN_CHAT_ID),
+            handle_admin_mail_input
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & ~filters.Chat(ADMIN_CHAT_ID),
+            handle_flow_email
+        )
+    )
+
+    application.add_error_handler(on_error)
+
+    logger.info("Bot starting…")
+    application.run_polling()
+
+    print("Initialization complete")
