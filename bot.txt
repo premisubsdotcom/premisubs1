@@ -60,6 +60,12 @@ IMAP_PORT = 993
 db_lock = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Markdown helper to escape underscores in usernames
+# ─────────────────────────────────────────────────────────────────────────────
+def escape_md(text: str) -> str:
+    return text.replace("_", r"\_")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Utility: Database load/save with lock
 # ─────────────────────────────────────────────────────────────────────────────
 def load_db():
@@ -109,7 +115,7 @@ def decrement_days_and_notify():
             save_db(data)
         for uid in to_notify:
             admin = application.bot.get_chat(ADMIN_CHAT_ID)
-            admin_username = f"@{admin.username}" if admin.username else ""
+            admin_username = f"@{escape_md(admin.username)}" if admin.username else ""
             lines = ["Your approved days are complete so please contact your supplier to extend the days"]
             if admin_username:
                 lines.append(f"supplier id: {admin_username}")
@@ -120,7 +126,7 @@ def decrement_days_and_notify():
             user = application.bot.get_chat(uid)
             mention = f"[{uid}](tg://user?id={uid})"
             fullname = user.full_name
-            uname = f"@{user.username}" if user.username else ""
+            uname = f"@{escape_md(user.username)}" if user.username else ""
             alert = ["Alert 🚨", mention, fullname]
             if uname:
                 alert.append(uname)
@@ -264,7 +270,7 @@ def _extract_signin_codes(imap_conn, uids):
         else:
             try:
                 pl = msg.get_payload(decode=True)
-                text = pl.decode(p.get_content_charset() or "utf-8", errors="replace")
+                text = pl.decode(msg.get_content_charset() or "utf-8", errors="replace")
             except:
                 text = ""
         m = pat.search(text)
@@ -292,7 +298,7 @@ def _extract_reset_links(imap_conn, uids):
         else:
             try:
                 pl = msg.get_payload(decode=True)
-                text = pl.decode(p.get_content_charset() or "utf-8", errors="replace")
+                text = pl.decode(msg.get_content_charset() or "utf-8", errors="replace")
             except:
                 text = ""
         m = pat.search(text)
@@ -350,7 +356,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usr = next((u for u in data["credentials"][0]["users"] if u["id"] == chat_id), None)
     if not usr or usr["days"] <= 0:
         admin = await context.bot.get_chat(ADMIN_CHAT_ID)
-        admin_username = f"@{admin.username}" if admin.username else ""
+        admin_username = f"@{escape_md(admin.username)}" if admin.username else ""
         text = f"Hey {user.full_name}, you are not approved to use this bot.\nSend /request to ask for access to your Netflix supplier/seller."
         if admin_username:
             text += f"\nSupplier id: {admin_username}"
@@ -366,7 +372,7 @@ async def fetch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not usr or usr["days"] <= 0:
         user = update.effective_user
         admin = await context.bot.get_chat(ADMIN_CHAT_ID)
-        admin_username = f"@{admin.username}" if admin.username else ""
+        admin_username = f"@{escape_md(admin.username)}" if admin.username else ""
         text = f"Hey {user.full_name}, you are not approved to use this bot.\nSend /request to ask for access to your Netflix supplier/seller."
         if admin_username:
             text += f"\nSupplier id: {admin_username}"
@@ -399,7 +405,7 @@ async def request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Request sent to admin.")
     admin = await context.bot.get_chat(ADMIN_CHAT_ID)
     user_link = f"[{uid}](tg://user?id={uid})"
-    username_md = f"@{user.username}" if user.username else ""
+    username_md = f"@{escape_md(user.username)}" if user.username else ""
     msg = (
         f"Hey {admin.full_name},\n"
         "Some user requested approval:\n\n"
@@ -904,7 +910,7 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     mention = f"[{user.id}](tg://user?id={user.id})"
     fullname = user.full_name
-    uname = f"@{user.username}" if user.username else ""
+    uname = f"@{escape_md(user.username)}" if user.username else ""
     lines = ["Alert 🚨", mention, fullname]
     if uname:
         lines.append(uname)
@@ -1022,15 +1028,15 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("info", info_cmd))
 
     application.add_handler(CallbackQueryHandler(toggle_feature_cb, pattern=r"^(toggle_household|toggle_signin|toggle_reset|disapprove_cb):"))
-    application.add_handler(CallbackQueryHandler(handle_set_all_mails_cb, pattern="^set_all_mails:\d+$"))
-    application.add_handler(CallbackQueryHandler(handle_set_specified_mails_cb, pattern="^set_specified_mails:\d+$"))
-    application.add_handler(CallbackQueryHandler(handle_cancel_specify_mails, pattern="^cancel_specify:\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_set_all_mails_cb, pattern="^set_all_mails:\\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_set_specified_mails_cb, pattern="^set_specified_mails:\\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_cancel_specify_mails, pattern="^cancel_specify:\\d+$"))
     application.add_handler(CallbackQueryHandler(handle_unlink_all_email, pattern="^unlink_all_email:"))
     application.add_handler(CallbackQueryHandler(handle_info_go_back, pattern="^info_go_back$"))
-    application.add_handler(CallbackQueryHandler(handle_see_specified_mails, pattern="^see_specified_mails:\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_see_specified_mails, pattern="^see_specified_mails:\\d+$"))
     application.add_handler(CallbackQueryHandler(cancel_cb, pattern="^cancel_cb$"))
-    application.add_handler(CallbackQueryHandler(unlink_mail_user_cb, pattern="^unlink_mail_user_cb:\d+$"))
-    application.add_handler(CallbackQueryHandler(link_mail_user_cb, pattern="^link_mail_user_cb:\d+$"))
+    application.add_handler(CallbackQueryHandler(unlink_mail_user_cb, pattern="^unlink_mail_user_cb:\\d+$"))
+    application.add_handler(CallbackQueryHandler(link_mail_user_cb, pattern="^link_mail_user_cb:\\d+$"))
     application.add_handler(CallbackQueryHandler(handle_fh, pattern="^fh$"))
     application.add_handler(CallbackQueryHandler(handle_fs, pattern="^fs$"))
     application.add_handler(CallbackQueryHandler(handle_fr, pattern="^fr$"))
