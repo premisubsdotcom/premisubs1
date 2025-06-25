@@ -355,11 +355,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_db()
     usr = next((u for u in data["credentials"][0]["users"] if u["id"] == chat_id), None)
     if not usr or usr["days"] <= 0:
-        admin = await context.bot.get_chat(ADMIN_CHAT_ID)
-        admin_username = f"@{escape_md(admin.username)}" if admin.username else ""
         text = f"Hey {user.full_name}, you are not approved to use this bot.\nSend /request to ask for access to your Netflix supplier/seller."
-        if admin_username:
-            text += f"\nSupplier id: {admin_username}"
         return await update.message.reply_text(text)
 
     await fetch_cmd(update, context)
@@ -371,11 +367,7 @@ async def fetch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not usr or usr["days"] <= 0:
         user = update.effective_user
-        admin = await context.bot.get_chat(ADMIN_CHAT_ID)
-        admin_username = f"@{escape_md(admin.username)}" if admin.username else ""
         text = f"Hey {user.full_name}, you are not approved to use this bot.\nSend /request to ask for access to your Netflix supplier/seller."
-        if admin_username:
-            text += f"\nSupplier id: {admin_username}"
         return await update.message.reply_text(text)
 
     buttons = []
