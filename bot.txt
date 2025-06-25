@@ -842,7 +842,7 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2) If they only have specific addresses (not “ALL”), make sure this one is in the list
     if allowed != ["ALL"] and email_addr.lower() not in [m.lower() for m in allowed]:
-        return await update.message.reply_text(
+        return await update.message_reply(
             f"❌ You’re not authorized to fetch mail for {email_addr}.\n"
             f"Allowed addresses: {', '.join(allowed)}"
         )
@@ -887,7 +887,7 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("No password reset links found in the last 15 minutes.")
             else:
                 for link in links:
-                    await update.message_reply(f"📧 Received from: info@account.netflix.com\n➤ Received to: {email_addr}\n🛡️ Reset link: {link}")
+                    await update.message.reply_text(f"📧 Received from: info@account.netflix.com\n➤ Received to: {email_addr}\n🛡️ Reset link: {link}")
             feature = "password reset link"
     except Exception as e:
         logger.error(f"Error during IMAP fetch: {e}")
@@ -954,7 +954,7 @@ async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_
             else:
                 skipped.append(mail)
         save_db(data)
-        return await update.message_reply(f"Unlinked: {removed}\nSkipped: {skipped}")
+        return await update.message.reply_text(f"Unlinked: {removed}\nSkipped: {skipped}")
 
     # 3) Linking new mails
     if "link_for" in context.user_data:
@@ -978,7 +978,7 @@ async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_
         msg = f"Linked new mails: {added}"
         if invalid:
             msg += f"\nSkipped invalid entries: {invalid}"
-        return await update.message_reply(msg)
+        return await update.message.reply_text(msg)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Broadcast handler for /send command and media with /send in caption
@@ -1144,7 +1144,6 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(handle_fr, pattern="^fr$"))
     application.add_handler(CallbackQueryHandler(handle_go_back, pattern="^go_back$"))
 
-    # Unified admin mail input for specifying, linking, unlinking
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.Chat(ADMIN_CHAT_ID),
@@ -1152,7 +1151,6 @@ if __name__ == "__main__":
         )
     )
 
-    # User flow for Netflix email fetch
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & ~filters.Chat(ADMIN_CHAT_ID),
@@ -1160,9 +1158,12 @@ if __name__ == "__main__":
         )
     )
 
-    # Broadcast handler for /send and media broadcasts
-    send_filter = filters.Chat(ADMIN_CHAT_ID) & (filters.Command("send") | filters.CaptionRegex(r"^/send"))
-    application.add_handler(MessageHandler(send_filter, broadcast_from_admin))
+    # Broadcast handlers:
+    # 1) plain text /send <message>
+    application.add_handler(CommandHandler("send", broadcast_from_admin))
+    # 2) media with caption starting `/send`
+    media_send_filter = filters.Chat(ADMIN_CHAT_ID) & filters.CaptionRegex(r"^/send")
+    application.add_handler(MessageHandler(media_send_filter, broadcast_from_admin))
 
     application.add_error_handler(on_error)
 
