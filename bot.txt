@@ -393,32 +393,32 @@ async def request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_chat.id
     user_rec = next((u for u in creds["users"] if u["id"] == uid), None)
     if user_rec and user_rec["days"] > 0:
-        return await update.message.reply_text("You are already approved.")
-    await update.message.reply_text("Request sent to admin.")
+        return await update.message_reply("You are already approved.")
+    await update.message_reply("Request sent to admin.")
     admin = await context.bot.get_chat(ADMIN_CHAT_ID)
     user_link = f"[{uid}](tg://user?id={uid})"
     username_md = f"@{escape_md(user.username)}" if user.username else ""
     msg = (
-        f"Hey {admin.full_name},\n"
-        "Some user requested approval:\n\n"
-        f"• Chat ID: {user_link}\n"
-        f"• Full name: {user.full_name}\n"
+        f"Hey {admin.full_name},\n"  
+        "Some user requested approval:\n\n"  
+        f"• Chat ID: {user_link}\n"  
+        f"• Full name: {user.full_name}\n"  
         f"• Username: {username_md}"
     )
     await context.bot.send_message(ADMIN_CHAT_ID, msg, parse_mode="Markdown")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID:
-        return await update.message.reply_text("You are not authorized.")
+        return await update.message_reply("You are not authorized.")
     try:
         _, target_s = update.message.text.split()
         target_id = int(target_s)
     except:
-        return await update.message.reply_text("Usage: /status <chat_id>")
+        return await update.message_reply("Usage: /status <chat_id>")
     data = load_db()
     usr = next((u for u in data["credentials"][0]["users"] if u["id"] == target_id), None)
     if not usr or usr["days"] <= 0:
-        return await update.message.reply_text(f"User {target_id} is not approved.")
+        return await update.message_reply(f"User {target_id} is not approved.")
     mails = usr.get("mails", [])
     mail_type = "ALL mails" if mails == ["ALL"] else "SPECIFIED mails"
     text = f"{target_id} has {usr['days']} days left. This user is set to {mail_type} and has access to:"
@@ -430,11 +430,11 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons.append([InlineKeyboardButton("See specified mails", callback_data=f"see_specified_mails:{target_id}")])
     buttons.append([InlineKeyboardButton("Disapprove mails", callback_data=f"disapprove_cb:{target_id}")])
     kb = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text(text, reply_markup=kb)
+    await update.message_reply(text, reply_markup=kb)
 
 async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID:
-        return await update.message.reply_text("You are not authorized to use /users.")
+        return await update.message_reply("You are not authorized to use /users.")
     data = load_db()
     users = data["credentials"][0]["users"]
     bio = BytesIO(json.dumps(users, indent=2).encode("utf-8"))
@@ -443,61 +443,60 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def terminate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID:
-        return await update.message.reply_text("You are not authorized to use /terminate.")
+        return await update.message_reply("You are not authorized to use /terminate.")
     data = load_db()
     data["credentials"][0]["users"] = []
     save_db(data)
-    await update.message.reply_text("All users have been disapproved.")
+    await update.message_reply("All users have been disapproved.")
 
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Contact @NoonXD for support")
+    await update.message_reply("Contact @NoonXD for support")
 
 async def commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id == ADMIN_CHAT_ID:
         msg = (
-            "Admin commands:\n"
-            "  /approve <chat_id> <days>   – Approve a user for <days> days\n"
-            "  /extend <chat_id> <days>    – Extend a user's remaining days by <days>\n"
-            "  /disapprove <chat_id>       – Disapprove (remove) a user immediately\n"
-            "  /status <chat_id>           – Show that user's days left and access toggles\n"
-            "  /users                      – Download JSON of all approved users\n"
-            "  /info <email>               – Show which users are linked to an email\n"
-            "  /mail                       – Clear IMAP credentials and reconfigure\n"
-            "  /terminate                  – Disapprove all users (clear users list)\n"
-            "  /reconfigure                – Factory reset the bot (delete all data)\n"
+            "Admin commands:\n"  
+            "  /approve <chat_id> <days>   – Approve a user for <days> days\n"  
+            "  /extend <chat_id> <days>    – Extend a user's remaining days by <days>\n"  
+            "  /disapprove <chat_id>       – Disapprove (remove) a user immediately\n"  
+            "  /status <chat_id>           – Show that user's days left and access toggles\n"  
+            "  /users                      – Download JSON of all approved users\n"  
+            "  /info <email>               – Show which users are linked to an email\n"  
+            "  /mail                       – Clear IMAP credentials and reconfigure\n"  
+            "  /terminate                  – Disapprove all users (clear users list)\n"  
+            "  /reconfigure                – Factory reset the bot (delete all data)\n"  
             "  /commands                   – Show this list of admin commands\n"
         )
     else:
         msg = (
-            "User commands:\n"
-            "  /fetch      – Start retrieving Netflix mail\n"
-            "  /request    – Request approval from the admin\n"
-            "  /status     – Show your remaining days (or approval status)\n"
-            "  /support    – Get support contact info\n"
-            "  /commands   – Show this list of user commands\n"
-            "\n"
-            "Plus, if approved and you have features enabled:\n"
-            "  • Tap one of the inline buttons (Household / Sign-in Code / Password Reset)\n"
+            "User commands:\n"  
+            "  /fetch      – Start retrieving Netflix mail\n"  
+            "  /request    – Request approval from the admin\n"  
+            "  /status     – Show your remaining days (or approval status)\n"  
+            "  /support    – Get support contact info\n"  
+            "  /commands   – Show this list of user commands\n\n"  
+            "Plus, if approved and you have features enabled:\n"  
+            "  • Tap one of the inline buttons (Household / Sign-in Code / Password Reset)\n"  
             "    to start retrieving your Netflix mail info.\n"
         )
-    await update.message.reply_text(msg)
+    await update.message_reply(msg)
 
 async def mail_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID:
-        return await update.message.reply_text("Not authorized.")
+        return await update.message_reply("Not authorized.")
     data = load_db()
     data["credentials"][0]["mail"] = ""
     data["credentials"][0]["pass"] = ""
     save_db(data)
-    await update.message.reply_text("IMAP credentials cleared. Please send me your Gmail address to configure the bot.")
+    await update.message_reply("IMAP credentials cleared. Please send me your Gmail address to configure the bot.")
     return ADMIN_EMAIL
 
 async def reconfigure_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID:
-        return await update.message.reply_text("Not authorized.")
+        return await update.message_reply("Not authorized.")
     initialize_db()
-    await update.message.reply_text("Factory reset complete.\nPlease send me your Gmail address to configure the bot.")
+    await update.message_reply("Factory reset complete.\nPlease send me your Gmail address to configure the bot.")
     return ADMIN_EMAIL
 
 async def cfg_start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -523,7 +522,7 @@ async def admin_email_received(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
     text = update.message.text.strip()
     if not text.lower().endswith("@gmail.com"):
-        await update.message.reply_text("That’s not a Gmail address.")
+        await update.message_reply("That’s not a Gmail address.")
         return ADMIN_EMAIL
     context.user_data["admin_mail"] = text
     kb = InlineKeyboardMarkup.from_row([
@@ -547,30 +546,30 @@ async def admin_pass_received(update: Update, context: ContextTypes.DEFAULT_TYPE
     save_db(data)
     kb = InlineKeyboardMarkup.from_button(InlineKeyboardButton("Commands", url="https://telegra.ph/Netflix-Bot-Help-Menu-05-31"))
     await temp.edit_text("Successfully connected.")
-    await update.message.reply_text("All set!", reply_markup=kb)
+    await update.message_reply("All set!", reply_markup=kb)
     return ConversationHandler.END
 
 async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID:
-        return await update.message.reply_text("Not authorized.")
+        return await update.message_reply("Not authorized.")
     try:
         _, chat_id_s, days_s = update.message.text.split()
         chat_id, days = int(chat_id_s), int(days_s)
     except:
-        return await update.message.reply_text("Usage: /approve <chat_id> <days>")
+        return await update.message_reply("Usage: /approve <chat_id> <days>")
     data = load_db()
     users = data["credentials"][0]["users"]
     usr = next((u for u in users if u["id"] == chat_id), None)
     if usr:
         if usr["days"] > 0:
-            return await update.message.reply_text(f"{chat_id} already approved for {usr['days']} days.")
+            return await update.message_reply(f"{chat_id} already approved for {usr['days']} days.")
         usr["days"] = days
         usr.setdefault("mails", [])
     else:
         users.append({"id": chat_id, "days": days, "household": True, "signin": False, "reset": False, "mails": []})
     save_db(data)
     mail_choice_markup = build_mail_choice_markup(chat_id, days)
-    await update.message.reply_text(f"Approved {chat_id} for {days} days.", reply_markup=mail_choice_markup)
+    await update.message_reply(f"Approved {chat_id} for {days} days.", reply_markup=mail_choice_markup)
 
 async def handle_set_all_mails_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
@@ -620,37 +619,37 @@ async def handle_cancel_specify_mails(update: Update, context: ContextTypes.DEFA
 
 async def extend(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID:
-        return await update.message.reply_text("Not authorized.")
+        return await update.message_reply("Not authorized.")
     try:
         _, chat_id_s, days_s = update.message.text.split()
         chat_id, days = int(chat_id_s), int(days_s)
     except:
-        return await update.message.reply_text("Usage: /extend <chat_id> <days>")
+        return await update.message_reply("Usage: /extend <chat_id> <days>")
     data = load_db()
     usr = next((u for u in data["credentials"][0]["users"] if u["id"] == chat_id), None)
     if not usr:
-        return await update.message.reply_text(f"{chat_id} is not approved.")
+        return await update.message_reply(f"{chat_id} is not approved.")
     usr["days"] += days
     usr.setdefault("mails", [])
     save_db(data)
     markup = build_access_markup(chat_id)
-    await update.message.reply_text(f"Extended {chat_id}: now {usr['days']} days left.\nThis user has access to:", reply_markup=markup)
+    await update.message_reply(f"Extended {chat_id}: now {usr['days']} days left.\nThis user has access to:", reply_markup=markup)
 
 async def disapprove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID:
-        return await update.message.reply_text("Not authorized.")
+        return await update.message_reply("Not authorized.")
     try:
         _, chat_id_s = update.message.text.split()
         chat_id = int(chat_id_s)
     except:
-        return await update.message.reply_text("Usage: /disapprove <chat_id>")
+        return await update.message_reply("Usage: /disapprove <chat_id>")
     data = load_db()
     new = [u for u in data["credentials"][0]["users"] if u["id"] != chat_id]
     if len(new) == len(data["credentials"][0]["users"]):
-        return await update.message.reply_text(f"{chat_id} is not approved.")
+        return await update.message_reply(f"{chat_id} is not approved.")
     data["credentials"][0]["users"] = new
     save_db(data)
-    await update.message.reply_text(f"Removed approval for {chat_id}.")
+    await update.message_reply(f"Removed approval for {chat_id}.")
 
 async def toggle_feature_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
@@ -678,9 +677,9 @@ async def toggle_feature_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID:
-        return await update.message.reply_text("You are not authorized.")
+        return await update.message_reply("You are not authorized.")
     if not context.args:
-        return await update.message.reply_text("Usage: /info <email>")
+        return await update.message_reply("Usage: /info <email>")
     email_arg = context.args[0].strip().lower()
     data = load_db()
     linked = [
@@ -690,7 +689,7 @@ async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
            or email_arg in [m.lower() for m in u.get("mails",[])]
     ]
     if not linked:
-        return await update.message.reply_text(f"{email_arg} is not linked to any user.")
+        return await update.message_reply(f"{email_arg} is not linked to any user.")
     result = {email_arg: linked}
     bio = BytesIO(json.dumps(result, indent=2).encode("utf-8"))
     bio.name = f"{email_arg.replace('@','_at_')}.json"
@@ -791,7 +790,7 @@ async def handle_fr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.callback_query.answer("Admins cannot fetch Netflix mails.")
     await update.callback_query.answer()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("Go Back ⏎", callback_data="go_back")]])
-    await update.callback_query.message.edit_text(f"Okay {update.effective_user.full_name}, send me your Netflix email to retrieve password reset link.", reply_markup=kb)
+    await update.callback_query.message.edit_text(f"Okay {update.effective_user.full_fullname}, send me your Netflix email to retrieve password reset link.", reply_markup=kb)
     context.user_data[F_FLOW_FLAG] = "fr"
 
 async def handle_go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -814,7 +813,7 @@ async def handle_go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop(F_FLOW_FLAG, None)
         return
     kb = InlineKeyboardMarkup.from_row(buttons)
-    await update.callback_query.message.edit_text(f"Hey {update.effective_user.full_name}, which Netflix mail would you like to retrieve?", reply_markup=kb)
+    await update.callback_query.message.edit_text(f"Hey {update.effective_user.full_fullname}, which Netflix mail would you like to retrieve?", reply_markup=kb)
     context.user_data.pop(F_FLOW_FLAG, None)
 
 async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -824,10 +823,10 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     flow = context.user_data.pop(F_FLOW_FLAG, None)
     if not flow:
-        return await update.message.reply_text("Unrecognized message. To retrieve Netflix mail, send /fetch")
+        return await update.message_reply("Unrecognized message. To retrieve Netflix mail, send /fetch")
     email_addr = update.message.text.strip()
     if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_addr):
-        return await update.message.reply_text("Please send a valid email address, or send /fetch to start over.")
+        return await update.message_reply("Please send a valid email address, or send /fetch to start over.")
 
     data = load_db()
     usr = next((u for u in data["credentials"][0]["users"] if u["id"] == update.effective_chat.id), None)
@@ -835,7 +834,7 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 1) Deny completely if the user has no mails configured
     if not allowed:
-        return await update.message.reply_text(
+        return await update.message_reply(
             "❌ You don’t have access to any Netflix accounts. "
             "Please ask your admin to grant you mail permissions."
         )
@@ -847,7 +846,7 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Allowed addresses: {', '.join(allowed)}"
         )
 
-    temp = await update.message.reply_text(
+    temp = await update.message_reply(
         f"Fetching Netflix {'household mail' if flow=='fh' else 'sign-in code' if flow=='fs' else 'password reset link'} for {email_addr}..."
     )
     mail, pwd = data["credentials"][0]["mail"], data["credentials"][0]["pass"]
@@ -866,28 +865,28 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results = await loop.run_in_executor(None, lambda: _extract_household_links(imap_conn, uids_15m))
             links = [l for l in results.values() if l]
             if not links:
-                await update.message.reply_text("No household links found in the last 15 minutes.")
+                await update.message_reply("No household links found in the last 15 minutes.")
             else:
                 for link in links:
-                    await update.message.reply_text(f"📧 Received from: info@account.netflix.com\n➤ Received to: {email_addr}\n🔗 Household link: {link}")
+                    await update.message_reply(f"📧 Received from: info@account.netflix.com\n➤ Received to: {email_addr}\n🔗 Household link: {link}")
             feature = "household link"
         elif flow == "fs":
             results = await loop.run_in_executor(None, lambda: _extract_signin_codes(imap_conn, uids_15m))
             codes = [c for c in results.values() if c]
             if not codes:
-                await update.message.reply_text("No sign-in codes found in the last 15 minutes.")
+                await update.message_reply("No sign-in codes found in the last 15 minutes.")
             else:
                 for code in codes:
-                    await update.message.reply_text(f"📧 Received from: info@account.netflix.com\n➤ Received to: {email_addr}\n🔑 Sign-in code: `{code}`", parse_mode="Markdown")
+                    await update.message_reply(f"📧 Received from: info@account.netflix.com\n➤ Received to: {email_addr}\n🔑 Sign-in code: `{code}`", parse_mode="Markdown")
             feature = "sign-in code"
         else:
             results = await loop.run_in_executor(None, lambda: _extract_reset_links(imap_conn, uids_15m))
             links = [l for l in results.values() if l]
             if not links:
-                await update.message.reply_text("No password reset links found in the last 15 minutes.")
+                await update.message_reply("No password reset links found in the last 15 minutes.")
             else:
                 for link in links:
-                    await update.message.reply_text(f"📧 Received from: info@account.netflix.com\n➤ Received to: {email_addr}\n🛡️ Reset link: {link}")
+                    await update.message_reply(f"📧 Received from: info@account.netflix.com\n➤ Received to: {email_addr}\n🛡️ Reset link: {link}")
             feature = "password reset link"
     except Exception as e:
         logger.error(f"Error during IMAP fetch: {e}")
@@ -910,7 +909,7 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"mail: {email_addr}")
     alert_text = "\n".join(lines)
     kb = InlineKeyboardMarkup.from_button(InlineKeyboardButton("Disapprove this user", callback_data=f"disapprove_cb:{user.id}"))
-    await context.bot.send_message(ADMIN_CHAT_ID, alert_text, parse_mode="Markdown", reply_markup=kb)
+   	await context.bot.send_message(ADMIN_CHAT_ID, alert_text, parse_mode="Markdown", reply_markup=kb)
 
 async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID:
@@ -927,18 +926,18 @@ async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_
             elif l:
                 invalid.append(l)
         if not valid:
-            return await update.message.reply_text("No valid email addresses detected. Please send valid emails one per line.")
+            return await update.message_reply("No valid email addresses detected. Please send valid emails one per line.")
         data = load_db()
         usr = next((u for u in data["credentials"][0]["users"] if u["id"] == chat_id), None)
         if not usr:
-            return await update.message.reply_text("User not found.")
+            return await update.message_reply("User not found.")
         usr["mails"] = valid
         save_db(data)
         markup = build_access_markup(chat_id)
         msg = f"Approved {chat_id} for {usr['days']} days for specified mails."
         if invalid:
             msg += f"\nIgnored invalid lines: {', '.join(invalid)}"
-        return await update.message.reply_text(msg, reply_markup=markup)
+        return await update.message_reply(msg, reply_markup=markup)
 
     # 2) Unlinking mails
     if "unlink_for" in context.user_data:
@@ -954,7 +953,7 @@ async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_
             else:
                 skipped.append(mail)
         save_db(data)
-        return await update.message.reply_text(f"Unlinked: {removed}\nSkipped: {skipped}")
+        return await update.message_reply(f"Unlinked: {removed}\nSkipped: {skipped}")
 
     # 3) Linking new mails
     if "link_for" in context.user_data:
@@ -978,7 +977,7 @@ async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_
         msg = f"Linked new mails: {added}"
         if invalid:
             msg += f"\nSkipped invalid entries: {invalid}"
-        return await update.message.reply_text(msg)
+        return await update.message_reply(msg)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Broadcast handler for /send command and media with /send in caption
@@ -1016,7 +1015,7 @@ async def broadcast_from_admin(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         body = " ".join(args)
 
-    header = "<u>⚜️ Message from Admin</u>\n\n"
+    header = "<b><u>⚜️ Message from Admin</u></b>\n\n"
     full_caption = header + (body if body else "")
 
     data = load_db()
