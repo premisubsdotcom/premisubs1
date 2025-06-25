@@ -912,70 +912,6 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup.from_button(InlineKeyboardButton("Disapprove this user", callback_data=f"disapprove_cb:{user.id}"))
     await context.bot.send_message(ADMIN_CHAT_ID, alert_text, parse_mode="Markdown", reply_markup=kb)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# New: Broadcast handler for admin (/send)
-# ─────────────────────────────────────────────────────────────────────────────
-async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only allow the admin to use this
-    if update.effective_chat.id != ADMIN_CHAT_ID:
-        return await update.message.reply_text("❌ You are not authorized to use /send.")
-    
-    heading = "⚜️ Message from Admin"
-    
-    # Load all approved user IDs
-    data = load_db()
-    user_ids = [u["id"] for u in data["credentials"][0]["users"] if u.get("days", 0) > 0]
-    if not user_ids:
-        return await update.message.reply_text("No users to send to.")
-    
-    msg = update.message
-    media_sent = False
-
-    # PHOTO
-    if msg.photo:
-        file_id = msg.photo[-1].file_id
-        caption = f"{heading}\n{msg.caption or ''}".strip()
-        for uid in user_ids:
-            await context.bot.send_photo(uid, photo=file_id, caption=caption)
-        media_sent = True
-
-    # VIDEO
-    elif msg.video:
-        file_id = msg.video.file_id
-        caption = f"{heading}\n{msg.caption or ''}".strip()
-        for uid in user_ids:
-            await context.bot.send_video(uid, video=file_id, caption=caption)
-        media_sent = True
-
-    # DOCUMENT
-    elif msg.document:
-        file_id = msg.document.file_id
-        caption = f"{heading}\n{msg.caption or ''}".strip()
-        for uid in user_ids:
-            await context.bot.send_document(uid, document=file_id, caption=caption)
-        media_sent = True
-
-    # AUDIO
-    elif msg.audio:
-        file_id = msg.audio.file_id
-        caption = f"{heading}\n{msg.caption or ''}".strip()
-        for uid in user_ids:
-            await context.bot.send_audio(uid, audio=file_id, caption=caption)
-        media_sent = True
-
-    # Plain text
-    if not media_sent:
-        text = msg.text or ""
-        payload = text.partition(" ")[2].strip()
-        if not payload:
-            return await update.message.reply_text("Usage: /send <your message> (or attach media with a caption).")
-        body = f"{heading}\n\n{payload}"
-        for uid in user_ids:
-            await context.bot.send_message(uid, body)
-
-    # Acknowledge back to admin
-    await update.message.reply_text(f"✅ Sent to {len(user_ids)} users.")
-
 async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID:
         return
@@ -1044,6 +980,66 @@ async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_
             msg += f"\nSkipped invalid entries: {invalid}"
         return await update.message.reply_text(msg)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# New broadcast handler
+# ─────────────────────────────────────────────────────────────────────────────
+async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # only admin may invoke
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return
+
+    # extract the payload after "/send"
+    raw = None
+    is_media = False
+    if update.message.text and update.message.text.startswith("/send"):
+        raw = update.message.text[len("/send"):].strip()
+    elif update.message.caption and update.message.caption.startswith("/send"):
+        raw = update.message.caption[len("/send"):].strip()
+        is_media = True
+    else:
+        return
+
+    heading = "⚜️ Message from Admin"
+    if not is_media:
+        full_text = f"{heading}\n{raw}" if raw else heading
+    else:
+        full_caption = f"{heading}\n{raw}" if raw else heading
+
+    # load all approved users
+    data = load_db()
+    user_ids = [u["id"] for u in data["credentials"][0]["users"] if u.get("days",0) > 0]
+
+    tasks = []
+    for uid in user_ids:
+        try:
+            if not is_media:
+                tasks.append(context.bot.send_message(uid, full_text))
+            else:
+                msg = update.message
+                if msg.photo:
+                    file_id = msg.photo[-1].file_id
+                    tasks.append(context.bot.send_photo(uid, file_id, caption=full_caption))
+                elif msg.video:
+                    file_id = msg.video.file_id
+                    tasks.append(context.bot.send_video(uid, file_id, caption=full_caption))
+                elif msg.document:
+                    file_id = msg.document.file_id
+                    tasks.append(context.bot.send_document(uid, file_id, caption=full_caption))
+        except Exception:
+            tb = traceback.format_exc()
+            bio = BytesIO(tb.encode("utf-8"))
+            bio.name = "broadcast_error.txt"
+            await context.bot.send_document(OWNER_CHAT_ID, bio, filename=bio.name, caption="Error while scheduling broadcast")
+
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        errors = [r for r in results if isinstance(r, Exception)]
+        if errors:
+            combined = "\n\n".join(traceback.format_exception(type(e), e, e.__traceback__) for e in errors)
+            bio = BytesIO(combined.encode("utf-8"))
+            bio.name = "broadcast_errors.txt"
+            await context.bot.send_document(OWNER_CHAT_ID, bio, filename=bio.name, caption="Errors during broadcast")
+
 if __name__ == "__main__":
     if not Path(DB_FILE).exists():
         initialize_db()
@@ -1078,7 +1074,7 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("approve", approve))
     application.add_handler(CommandHandler("extend", extend))
     application.add_handler(CommandHandler("disapprove", disapprove))
-    application.add_handler(CommandHandler("send", send_all))
+    application.add_handler(CommandHandler("terminate", terminate))
     application.add_handler(CommandHandler("support", support))
     application.add_handler(CommandHandler("commands", commands))
     application.add_handler(CommandHandler("info", info_cmd))
@@ -1110,6 +1106,22 @@ if __name__ == "__main__":
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & ~filters.Chat(ADMIN_CHAT_ID),
             handle_flow_email
+        )
+    )
+
+    # Broadcast handlers for /send command
+    application.add_handler(
+        MessageHandler(
+            filters.Chat(ADMIN_CHAT_ID) & filters.TEXT & filters.Regex(r"^/send\b"),
+            send_broadcast
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.Chat(ADMIN_CHAT_ID) &
+            (filters.PHOTO | filters.VIDEO | filters.DOCUMENT) &
+            filters.CaptionRegex(r"^/send\b"),
+            send_broadcast
         )
     )
 
