@@ -19,6 +19,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -981,64 +982,61 @@ async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_
         return await update.message.reply_text(msg)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# New broadcast handler
+# New send_handler for broadcasting admin messages
 # ─────────────────────────────────────────────────────────────────────────────
-async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # only admin may invoke
+async def send_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # only allow admin
     if update.effective_chat.id != ADMIN_CHAT_ID:
-        return
-
-    # extract the payload after "/send"
-    raw = None
-    is_media = False
-    if update.message.text and update.message.text.startswith("/send"):
-        raw = update.message.text[len("/send"):].strip()
-    elif update.message.caption and update.message.caption.startswith("/send"):
-        raw = update.message.caption[len("/send"):].strip()
-        is_media = True
-    else:
-        return
-
-    heading = "⚜️ Message from Admin"
-    if not is_media:
-        full_text = f"{heading}\n{raw}" if raw else heading
-    else:
-        full_caption = f"{heading}\n{raw}" if raw else heading
-
-    # load all approved users
+        return await update.message.reply_text("Not authorized.")
+    # underlined prefix in MarkdownV2
+    prefix = "__⚜️ Message from Admin__\n"
+    # load all approved user IDs
     data = load_db()
-    user_ids = [u["id"] for u in data["credentials"][0]["users"] if u.get("days",0) > 0]
-
+    user_ids = [u["id"] for u in data["credentials"][0]["users"] if u["days"] > 0]
+    msg = update.message
     tasks = []
     for uid in user_ids:
         try:
-            if not is_media:
-                tasks.append(context.bot.send_message(uid, full_text))
+            if msg.photo or msg.video or msg.document or msg.audio or msg.voice:
+                # copy media with our caption
+                tasks.append(
+                    context.bot.copy_message(
+                        chat_id=uid,
+                        from_chat_id=ADMIN_CHAT_ID,
+                        message_id=msg.message_id,
+                        caption=prefix + (msg.caption or ""),
+                        parse_mode=ParseMode.MARKDOWN_V2
+                    )
+                )
             else:
-                msg = update.message
-                if msg.photo:
-                    file_id = msg.photo[-1].file_id
-                    tasks.append(context.bot.send_photo(uid, file_id, caption=full_caption))
-                elif msg.video:
-                    file_id = msg.video.file_id
-                    tasks.append(context.bot.send_video(uid, file_id, caption=full_caption))
-                elif msg.document:
-                    file_id = msg.document.file_id
-                    tasks.append(context.bot.send_document(uid, file_id, caption=full_caption))
+                # text-only: strip command, send text
+                text_parts = msg.text.split(" ", 1)
+                body = text_parts[1] if len(text_parts) > 1 else ""
+                tasks.append(
+                    context.bot.send_message(
+                        chat_id=uid,
+                        text=prefix + body,
+                        parse_mode=ParseMode.MARKDOWN_V2
+                    )
+                )
         except Exception:
-            tb = traceback.format_exc()
-            bio = BytesIO(tb.encode("utf-8"))
-            bio.name = "broadcast_error.txt"
-            await context.bot.send_document(OWNER_CHAT_ID, bio, filename=bio.name, caption="Error while scheduling broadcast")
-
-    if tasks:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        errors = [r for r in results if isinstance(r, Exception)]
-        if errors:
-            combined = "\n\n".join(traceback.format_exception(type(e), e, e.__traceback__) for e in errors)
-            bio = BytesIO(combined.encode("utf-8"))
-            bio.name = "broadcast_errors.txt"
-            await context.bot.send_document(OWNER_CHAT_ID, bio, filename=bio.name, caption="Errors during broadcast")
+            # ignore per-user errors here
+            pass
+    # execute all sends in parallel
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # collect any errors
+    errors = [r for r in results if isinstance(r, Exception)]
+    if errors:
+        err = errors[0]
+        tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+        bio = BytesIO(tb.encode("utf-8"))
+        bio.name = "send_error.txt"
+        await context.bot.send_document(
+            OWNER_CHAT_ID,
+            document=bio,
+            filename=bio.name,
+            caption="Error when broadcasting admin message"
+        )
 
 if __name__ == "__main__":
     if not Path(DB_FILE).exists():
@@ -1109,21 +1107,8 @@ if __name__ == "__main__":
         )
     )
 
-    # Broadcast handlers for /send command
-    application.add_handler(
-        MessageHandler(
-            filters.Chat(ADMIN_CHAT_ID) & filters.TEXT & filters.Regex(r"^/send\b"),
-            send_broadcast
-        )
-    )
-    application.add_handler(
-        MessageHandler(
-            filters.Chat(ADMIN_CHAT_ID) &
-            (filters.PHOTO | filters.VIDEO | filters.DOCUMENT) &
-            filters.CaptionRegex(r"^/send\b"),
-            send_broadcast
-        )
-    )
+    # send command for broadcasting admin messages
+    application.add_handler(CommandHandler("send", send_handler))
 
     application.add_error_handler(on_error)
 
