@@ -19,7 +19,6 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -888,7 +887,7 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("No password reset links found in the last 15 minutes.")
             else:
                 for link in links:
-                    await update.message.reply_text(f"📧 Received from: info@account.netflix.com\n➤ Received to: {email_addr}\n🛡️ Reset link: {link}")
+                    await update.message_reply(f"📧 Received from: info@account.netflix.com\n➤ Received to: {email_addr}\n🛡️ Reset link: {link}")
             feature = "password reset link"
     except Exception as e:
         logger.error(f"Error during IMAP fetch: {e}")
@@ -955,7 +954,7 @@ async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_
             else:
                 skipped.append(mail)
         save_db(data)
-        return await update.message.reply_text(f"Unlinked: {removed}\nSkipped: {skipped}")
+        return await update.message_reply(f"Unlinked: {removed}\nSkipped: {skipped}")
 
     # 3) Linking new mails
     if "link_for" in context.user_data:
@@ -979,63 +978,117 @@ async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_
         msg = f"Linked new mails: {added}"
         if invalid:
             msg += f"\nSkipped invalid entries: {invalid}"
-        return await update.message.reply_text(msg)
+        return await update.message_reply(msg)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# New send_handler for broadcasting admin messages
+# Broadcast handler for /send command and media with /send in caption
 # ─────────────────────────────────────────────────────────────────────────────
-async def send_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # only allow admin
+async def broadcast_from_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID:
-        return await update.message.reply_text("Not authorized.")
-    # underlined prefix in MarkdownV2
-    prefix = "__⚜️ Message from Admin__\n"
-    # load all approved user IDs
-    data = load_db()
-    user_ids = [u["id"] for u in data["credentials"][0]["users"] if u["days"] > 0]
+        return
+
     msg = update.message
+    text = msg.text or ""
+    caption = msg.caption or ""
+    args = context.args
+    has_media = any([msg.photo, msg.video, msg.document, msg.sticker, msg.animation])
+
+    # Plain /send with no args
+    if not has_media and not args:
+        return await msg.reply_text(
+            "📣 *Usage for broadcasts:*\n"
+            "• `/send <message>` to broadcast text\n"
+            "• Attach a photo/video/document/etc with a caption starting with `/send` to broadcast media",
+            parse_mode="Markdown"
+        )
+
+    # Media present but caption doesn't start with /send
+    if has_media and not caption.strip().startswith("/send"):
+        return await msg.reply_text(
+            "📣 *Usage for media broadcasts:*\n"
+            "Attach your media with a caption beginning with `/send <message>`",
+            parse_mode="Markdown"
+        )
+
+    # Extract body text
+    if has_media:
+        body = caption.strip()[len("/send"):].lstrip()
+    else:
+        body = " ".join(args)
+
+    header = "<u>⚜️ Message from Admin</u>\n\n"
+    full_caption = header + (body if body else "")
+
+    data = load_db()
+    user_ids = [u["id"] for u in data["credentials"][0]["users"]]
+
     tasks = []
-    for uid in user_ids:
-        try:
-            if msg.photo or msg.video or msg.document or msg.audio or msg.voice:
-                # copy media with our caption
-                tasks.append(
-                    context.bot.copy_message(
-                        chat_id=uid,
-                        from_chat_id=ADMIN_CHAT_ID,
-                        message_id=msg.message_id,
-                        caption=prefix + (msg.caption or ""),
-                        parse_mode=ParseMode.MARKDOWN_V2
-                    )
-                )
-            else:
-                # text-only: strip command, send text
-                text_parts = msg.text.split(" ", 1)
-                body = text_parts[1] if len(text_parts) > 1 else ""
-                tasks.append(
-                    context.bot.send_message(
-                        chat_id=uid,
-                        text=prefix + body,
-                        parse_mode=ParseMode.MARKDOWN_V2
-                    )
-                )
-        except Exception:
-            # ignore per-user errors here
-            pass
-    # execute all sends in parallel
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    # collect any errors
-    errors = [r for r in results if isinstance(r, Exception)]
-    if errors:
-        err = errors[0]
-        tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+    if not has_media:
+        for uid in user_ids:
+            tasks.append(context.bot.send_message(
+                chat_id=uid,
+                text=full_caption,
+                parse_mode="HTML"
+            ))
+    else:
+        if msg.photo:
+            file_id = msg.photo[-1].file_id
+            for uid in user_ids:
+                tasks.append(context.bot.send_photo(
+                    chat_id=uid,
+                    photo=file_id,
+                    caption=full_caption,
+                    parse_mode="HTML"
+                ))
+        elif msg.video:
+            file_id = msg.video.file_id
+            for uid in user_ids:
+                tasks.append(context.bot.send_video(
+                    chat_id=uid,
+                    video=file_id,
+                    caption=full_caption,
+                    parse_mode="HTML"
+                ))
+        elif msg.document:
+            file_id = msg.document.file_id
+            for uid in user_ids:
+                tasks.append(context.bot.send_document(
+                    chat_id=uid,
+                    document=file_id,
+                    caption=full_caption,
+                    parse_mode="HTML"
+                ))
+        elif msg.sticker:
+            file_id = msg.sticker.file_id
+            for uid in user_ids:
+                tasks.append(context.bot.send_sticker(
+                    chat_id=uid,
+                    sticker=file_id
+                ))
+        elif msg.animation:
+            file_id = msg.animation.file_id
+            for uid in user_ids:
+                tasks.append(context.bot.send_animation(
+                    chat_id=uid,
+                    animation=file_id,
+                    caption=full_caption,
+                    parse_mode="HTML"
+                ))
+        else:
+            return await msg.reply_text("❌ Unsupported media type for broadcast.")
+
+    try:
+        await asyncio.gather(*tasks)
+        await msg.reply_text(f"✅ Successfully sent to {len(user_ids)} users.")
+    except Exception:
+        tb = traceback.format_exc()
         bio = BytesIO(tb.encode("utf-8"))
-        bio.name = "send_error.txt"
+        bio.name = "broadcast_error.txt"
         await context.bot.send_document(
             OWNER_CHAT_ID,
             document=bio,
             filename=bio.name,
-            caption="Error when broadcasting admin message"
+            caption="Error during broadcast"
         )
 
 if __name__ == "__main__":
@@ -1043,7 +1096,6 @@ if __name__ == "__main__":
         initialize_db()
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
-    scheduler.start()
 
     cfg_conv = ConversationHandler(
         entry_points=[
@@ -1092,7 +1144,7 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(handle_fr, pattern="^fr$"))
     application.add_handler(CallbackQueryHandler(handle_go_back, pattern="^go_back$"))
 
-    # Unified admin text handler for mails
+    # Unified admin mail input for specifying, linking, unlinking
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.Chat(ADMIN_CHAT_ID),
@@ -1100,6 +1152,7 @@ if __name__ == "__main__":
         )
     )
 
+    # User flow for Netflix email fetch
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & ~filters.Chat(ADMIN_CHAT_ID),
@@ -1107,8 +1160,9 @@ if __name__ == "__main__":
         )
     )
 
-    # send command for broadcasting admin messages
-    application.add_handler(CommandHandler("send", send_handler))
+    # Broadcast handler for /send and media broadcasts
+    send_filter = filters.Chat(ADMIN_CHAT_ID) & (filters.Command("send") | filters.CaptionRegex(r"^/send"))
+    application.add_handler(MessageHandler(send_filter, broadcast_from_admin))
 
     application.add_error_handler(on_error)
 
