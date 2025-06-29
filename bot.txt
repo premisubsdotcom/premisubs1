@@ -817,14 +817,19 @@ async def handle_go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.edit_text(f"Hey {update.effective_user.full_name}, which Netflix mail would you like to retrieve?", reply_markup=kb)
     context.user_data.pop(F_FLOW_FLAG, None)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Modified handler_flow_email with fixes for Markdown parsing and temp message handling
+# ─────────────────────────────────────────────────────────────────────────────
 async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id == ADMIN_CHAT_ID:
         return
     if MAIL_FLOW_FLAG in context.user_data:
         return
+
     flow = context.user_data.pop(F_FLOW_FLAG, None)
     if not flow:
         return await update.message.reply_text("Unrecognized message. To retrieve Netflix mail, send /fetch")
+
     email_addr = update.message.text.strip()
     if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_addr):
         return await update.message.reply_text("Please send a valid email address, or send /fetch to start over.")
@@ -842,17 +847,20 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2) If they only have specific addresses (not “ALL”), make sure this one is in the list
     if allowed != ["ALL"] and email_addr.lower() not in [m.lower() for m in allowed]:
-        return await update.message_reply(
+        return await update.message.reply_text(
             f"❌ You’re not authorized to fetch mail for {email_addr}.\n"
             f"Allowed addresses: {', '.join(allowed)}"
         )
 
+    # Send initial fetching message
     temp = await update.message.reply_text(
         f"Fetching Netflix {'household mail' if flow=='fh' else 'sign-in code' if flow=='fs' else 'password reset link'} for {email_addr}..."
     )
+
     mail, pwd = data["credentials"][0]["mail"], data["credentials"][0]["pass"]
     loop = asyncio.get_event_loop()
     imap_conn = None
+
     try:
         imap_conn = await loop.run_in_executor(None, lambda: _connect_to_gmail(mail, pwd))
         uids_hour = await loop.run_in_executor(None, lambda: _search_last_hour(imap_conn, email_addr))
@@ -861,37 +869,57 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uids_15m = await loop.run_in_executor(None, lambda: _filter_uids_last_15m(imap_conn, uids_hour))
         if not uids_15m:
             return await temp.edit_text(f"No Netflix emails in the last 15 minutes for {email_addr}.")
-        await temp.delete()
+
         if flow == "fh":
             results = await loop.run_in_executor(None, lambda: _extract_household_links(imap_conn, uids_15m))
             links = [l for l in results.values() if l]
             if not links:
-                await update.message.reply_text("No household links found in the last 15 minutes.")
+                await temp.edit_text("No household links found in the last 15 minutes.")
             else:
                 for link in links:
-                    await update.message.reply_text(f"📧 Received from: info@account.netflix.com\n➤ Received to: {email_addr}\n🔗 Household link: {link}")
+                    await update.message.reply_text(
+                        f"📧 Received from: info@account.netflix.com\n"
+                        f"➤ Received to: {email_addr}\n"
+                        f"🔗 Household link: {link}"
+                    )
+                await temp.delete()
             feature = "household link"
+
         elif flow == "fs":
             results = await loop.run_in_executor(None, lambda: _extract_signin_codes(imap_conn, uids_15m))
             codes = [c for c in results.values() if c]
             if not codes:
-                await update.message.reply_text("No sign-in codes found in the last 15 minutes.")
+                await temp.edit_text("No sign-in codes found in the last 15 minutes.")
             else:
                 for code in codes:
-                    await update.message.reply_text(f"📧 Received from: info@account.netflix.com\n➤ Received to: {email_addr}\n🔑 Sign-in code: `{code}`", parse_mode="Markdown")
+                    await update.message.reply_text(
+                        f"📧 Received from: info@account.netflix.com\n"
+                        f"➤ Received to: <code>{email_addr}</code>\n"
+                        f"🔑 Sign-in code: <code>{code}</code>",
+                        parse_mode="HTML"
+                    )
+                await temp.delete()
             feature = "sign-in code"
+
         else:
             results = await loop.run_in_executor(None, lambda: _extract_reset_links(imap_conn, uids_15m))
             links = [l for l in results.values() if l]
             if not links:
-                await update.message.reply_text("No password reset links found in the last 15 minutes.")
+                await temp.edit_text("No password reset links found in the last 15 minutes.")
             else:
                 for link in links:
-                    await update.message.reply_text(f"📧 Received from: info@account.netflix.com\n➤ Received to: {email_addr}\n🛡️ Reset link: {link}")
+                    await update.message.reply_text(
+                        f"📧 Received from: info@account.netflix.com\n"
+                        f"➤ Received to: {email_addr}\n"
+                        f"🛡️ Reset link: {link}"
+                    )
+                await temp.delete()
             feature = "password reset link"
+
     except Exception as e:
-        logger.error(f"Error during IMAP fetch: {e}")
-        await temp.edit_text("Error occurred while fetching emails.")
+        logger.error(f"Error during IMAP fetch: {e}", exc_info=True)
+        # Send a new error message rather than editing a possibly-deleted one
+        await update.message.reply_text("Error occurred while fetching emails.")
     finally:
         if imap_conn:
             try:
@@ -899,6 +927,7 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
 
+    # Notify admin of successful fetch
     user = update.effective_user
     mention = f"[{user.id}](tg://user?id={user.id})"
     fullname = user.full_name
