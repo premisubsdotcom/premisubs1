@@ -385,7 +385,29 @@ async def fetch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Hey {update.effective_user.full_name}, which Netflix mail would you like to retrieve?", reply_markup=kb)
 
 async def request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id == ADMIN_CHAT_ID:
+    chat = update.effective_chat
+    user = update.effective_user
+
+    # Handle group requests
+    if chat.type in ("group", "supergroup"):
+        admin = await context.bot.get_chat(ADMIN_CHAT_ID)
+        mention   = f"[{user.id}](tg://user?id={user.id})"
+        username  = f"@{escape_md(user.username)}" if user.username else ""
+        msg = (
+            f"Hey {admin.full_name},\n"
+            "Some user requested approval from group\n\n"
+            "Group details:\n"
+            f"• Chat ID: `{chat.id}`\n"
+            f"• Name: *{escape_md(chat.title)}*\n\n"
+            "Requested by:\n"
+            f"• {mention}\n"
+            f"• {escape_md(user.full_name)}"
+            + (f"\n• {username}" if username else "")
+        )
+        await context.bot.send_message(ADMIN_CHAT_ID, msg, parse_mode="Markdown")
+        return
+
+    if chat.id == ADMIN_CHAT_ID:
         return await update.message.reply_text("Admins cannot use /request.")
     user = update.effective_user
     data = load_db()
@@ -722,9 +744,9 @@ async def handle_unlink_all_email(update: Update, context: ContextTypes.DEFAULT_
                 changed = True
     if changed:
         save_db(data)
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"✅ Unlinked {email_arg} from all users.")
+        await update.callback_query.message.reply_text(f"✅ Unlinked {email_arg} from all users.")
     else:
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"ℹ️ No user had {email_arg} linked.")
+        await update.callback_query.message.reply_text(f"ℹ️ No user had {email_arg} linked.")
 
 async def handle_info_go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
@@ -817,9 +839,6 @@ async def handle_go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.edit_text(f"Hey {update.effective_user.full_name}, which Netflix mail would you like to retrieve?", reply_markup=kb)
     context.user_data.pop(F_FLOW_FLAG, None)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Modified handler_flow_email with fixes for Markdown parsing and temp message handling
-# ─────────────────────────────────────────────────────────────────────────────
 async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id == ADMIN_CHAT_ID:
         return
