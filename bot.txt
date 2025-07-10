@@ -512,7 +512,7 @@ async def mail_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Not authorized.")
     data = load_db()
     data["credentials"][0]["mail"] = ""
-    data["credentials"][0]["pass"] = ""
+    data["credentials"][0]["pass"]] = ""
     save_db(data)
     await update.message.reply_text("IMAP credentials cleared. Please send me your Gmail address to configure the bot.")
     return ADMIN_EMAIL
@@ -554,7 +554,7 @@ async def admin_email_received(update: Update, context: ContextTypes.DEFAULT_TYP
         InlineKeyboardButton("How to get app password", url="https://telegra.ph/How-to-get-my-App-Password-05-29"),
         InlineKeyboardButton("Wrong mail", callback_data="cfg_start"),
     ])
-    await update.message.reply_text("Now send me your app password.", reply_markup=kb)
+    await update.message.reply_text("Now send me your app password.",	reply_markup=kb)
     return ADMIN_PASS
 
 async def admin_pass_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -892,7 +892,7 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await temp.edit_text(f"No Netflix emails in the last hour for {email_addr}.")
         uids_15m = await loop.run_in_executor(None, lambda: _filter_uids_last_15m(imap_conn, uids_hour))
         if not uids_15m:
-            return await temp.edit_text(f"No Netflix emails in the last 15 minutes for {email_addr}.")
+            return await temp.edit_text(f"No Netflix emails in the last 15 minutes for {email_addr}.") 
 
         if flow == "fh":
             results = await loop.run_in_executor(None, lambda: _extract_household_links(imap_conn, uids_15m))
@@ -1183,9 +1183,9 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("info", info_cmd))
 
     application.add_handler(CallbackQueryHandler(toggle_feature_cb, pattern=r"^(toggle_household|toggle_signin|toggle_reset|disapprove_cb):"))
-    application.add_handler(CallbackQueryHandler(handle_set_all_mails_cb, pattern="^set_all_mails:\\d+$"))
-    application.add_handler(CallbackQueryHandler(handle_set_specified_mails_cb, pattern="^set_specified_mails:\\d+$"))
-    application.add_handler(CallbackQueryHandler(handle_cancel_specify_mails, pattern="^cancel_specify:\\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_set_all_mails_cb, pattern=r"^set_all_mails:-?\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_set_specified_mails_cb, pattern=r"^set_specified_mails:-?\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_cancel_specify_mails, pattern=r"^cancel_specify:-?\d+$"))
     application.add_handler(CallbackQueryHandler(handle_unlink_all_email, pattern="^unlink_all_email:"))
     application.add_handler(CallbackQueryHandler(handle_info_go_back, pattern="^info_go_back$"))
     application.add_handler(CallbackQueryHandler(handle_see_specified_mails, pattern="^see_specified_mails:\\d+$"))
