@@ -18,6 +18,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Chat,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -385,12 +386,38 @@ async def fetch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Hey {update.effective_user.full_name}, which Netflix mail would you like to retrieve?", reply_markup=kb)
 
 async def request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id == ADMIN_CHAT_ID:
+    chat = update.effective_chat
+
+    # —— Group request branch with “already approved” check ——
+    if chat.type in (Chat.GROUP, Chat.SUPERGROUP):
+        data = load_db()
+        # Check if this group is already approved
+        grp = next((u for u in data["credentials"][0]["users"] if u["id"] == chat.id), None)
+        if grp and grp["days"] > 0:
+            return await update.message.reply_text("This group is already approved and has access to the bot.")
+        # Otherwise, send a fresh group request
+        await update.message.reply_text("👍 Your group request has been sent to the admin.")
+        admin = await context.bot.get_chat(ADMIN_CHAT_ID)
+        msg = (
+            f"Hey {admin.full_name},\n"
+            "Some user requested approval *from a group*.\n\n"
+            "Group details:\n"
+            f"• Chat ID: `{chat.id}`\n"
+            f"• Group name: *{chat.title}*"
+        )
+        await context.bot.send_message(
+            ADMIN_CHAT_ID,
+            msg,
+            parse_mode="Markdown"
+        )
+        return
+
+    if chat.id == ADMIN_CHAT_ID:
         return await update.message.reply_text("Admins cannot use /request.")
     user = update.effective_user
     data = load_db()
     creds = data["credentials"][0]
-    uid = update.effective_chat.id
+    uid = chat.id
     user_rec = next((u for u in creds["users"] if u["id"] == uid), None)
     if user_rec and user_rec["days"] > 0:
         return await update.message.reply_text("You are already approved.")
@@ -667,11 +694,11 @@ async def toggle_feature_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not usr:
         return await update.callback_query.answer("User not found.")
     if action == "toggle_household":
-        usr["household"] = not usr["household"]
+        usr["household"] = not usr['household']
     elif action == "toggle_signin":
-        usr["signin"] = not usr["signin"]
+        usr["signin"] = not usr['signin']
     elif action == "toggle_reset":
-        usr["reset"] = not usr["reset"]
+        usr["reset"] = not usr['reset']
     save_db(data)
     markup = build_access_markup(chat_id)
     await update.callback_query.message.edit_text(f"Access settings for {chat_id}:", reply_markup=markup)
@@ -817,9 +844,6 @@ async def handle_go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.edit_text(f"Hey {update.effective_user.full_name}, which Netflix mail would you like to retrieve?", reply_markup=kb)
     context.user_data.pop(F_FLOW_FLAG, None)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Modified handler_flow_email with fixes for Markdown parsing and temp message handling
-# ─────────────────────────────────────────────────────────────────────────────
 async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id == ADMIN_CHAT_ID:
         return
@@ -838,21 +862,18 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usr = next((u for u in data["credentials"][0]["users"] if u["id"] == update.effective_chat.id), None)
     allowed = usr.get("mails", [])
 
-    # 1) Deny completely if the user has no mails configured
     if not allowed:
         return await update.message.reply_text(
             "❌ You don’t have access to any Netflix accounts. "
             "Please ask your admin to grant you mail permissions."
         )
 
-    # 2) If they only have specific addresses (not “ALL”), make sure this one is in the list
     if allowed != ["ALL"] and email_addr.lower() not in [m.lower() for m in allowed]:
         return await update.message.reply_text(
             f"❌ You’re not authorized to fetch mail for {email_addr}.\n"
             f"Allowed addresses: {', '.join(allowed)}"
         )
 
-    # Send initial fetching message
     temp = await update.message.reply_text(
         f"Fetching Netflix {'household mail' if flow=='fh' else 'sign-in code' if flow=='fs' else 'password reset link'} for {email_addr}..."
     )
@@ -918,7 +939,6 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Error during IMAP fetch: {e}", exc_info=True)
-        # Send a new error message rather than editing a possibly-deleted one
         await update.message.reply_text("Error occurred while fetching emails.")
     finally:
         if imap_conn:
@@ -927,7 +947,6 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
 
-    # Notify admin of successful fetch
     user = update.effective_user
     mention = f"[{user.id}](tg://user?id={user.id})"
     fullname = user.full_name
@@ -944,7 +963,6 @@ async def handle_flow_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID:
         return
-    # 1) Specifying mails for a user
     if MAIL_FLOW_FLAG in context.user_data:
         chat_id = context.user_data.pop(MAIL_FLOW_FLAG)
         lines = [l.strip() for l in update.message.text.splitlines()]
@@ -968,8 +986,6 @@ async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_
         if invalid:
             msg += f"\nIgnored invalid lines: {', '.join(invalid)}"
         return await update.message.reply_text(msg, reply_markup=markup)
-
-    # 2) Unlinking mails
     if "unlink_for" in context.user_data:
         chat_id = context.user_data.pop("unlink_for")
         lines = [l.strip() for l in update.message.text.splitlines() if l.strip()]
@@ -984,8 +1000,6 @@ async def handle_admin_mail_input(update: Update, context: ContextTypes.DEFAULT_
                 skipped.append(mail)
         save_db(data)
         return await update.message.reply_text(f"Unlinked: {removed}\nSkipped: {skipped}")
-
-    # 3) Linking new mails
     if "link_for" in context.user_data:
         chat_id = context.user_data.pop("link_for")
         lines = [l.strip() for l in update.message.text.splitlines() if l.strip()]
@@ -1022,7 +1036,6 @@ async def broadcast_from_admin(update: Update, context: ContextTypes.DEFAULT_TYP
     args = context.args
     has_media = any([msg.photo, msg.video, msg.document, msg.sticker, msg.animation])
 
-    # Plain /send with no args
     if not has_media and not args:
         return await msg.reply_text(
             "📣 *Usage for broadcasts:*\n"
@@ -1031,7 +1044,6 @@ async def broadcast_from_admin(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="Markdown"
         )
 
-    # Media present but caption doesn't start with /send
     if has_media and not caption.strip().startswith("/send"):
         return await msg.reply_text(
             "📣 *Usage for media broadcasts:*\n"
@@ -1039,7 +1051,6 @@ async def broadcast_from_admin(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="Markdown"
         )
 
-    # Extract body text
     if has_media:
         body = caption.strip()[len("/send"):].lstrip()
     else:
@@ -1159,15 +1170,15 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("info", info_cmd))
 
     application.add_handler(CallbackQueryHandler(toggle_feature_cb, pattern=r"^(toggle_household|toggle_signin|toggle_reset|disapprove_cb):"))
-    application.add_handler(CallbackQueryHandler(handle_set_all_mails_cb, pattern="^set_all_mails:\\d+$"))
-    application.add_handler(CallbackQueryHandler(handle_set_specified_mails_cb, pattern="^set_specified_mails:\\d+$"))
-    application.add_handler(CallbackQueryHandler(handle_cancel_specify_mails, pattern="^cancel_specify:\\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_set_all_mails_cb, pattern=r"^set_all_mails:-?\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_set_specified_mails_cb, pattern=r"^set_specified_mails:-?\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_cancel_specify_mails, pattern=r"^cancel_specify:-?\d+$"))
     application.add_handler(CallbackQueryHandler(handle_unlink_all_email, pattern="^unlink_all_email:"))
     application.add_handler(CallbackQueryHandler(handle_info_go_back, pattern="^info_go_back$"))
-    application.add_handler(CallbackQueryHandler(handle_see_specified_mails, pattern="^see_specified_mails:\\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_see_specified_mails, pattern="^see_specified_mails:-?\d+$"))
     application.add_handler(CallbackQueryHandler(cancel_cb, pattern="^cancel_cb$"))
-    application.add_handler(CallbackQueryHandler(unlink_mail_user_cb, pattern="^unlink_mail_user_cb:\\d+$"))
-    application.add_handler(CallbackQueryHandler(link_mail_user_cb, pattern="^link_mail_user_cb:\\d+$"))
+    application.add_handler(CallbackQueryHandler(unlink_mail_user_cb, pattern="^unlink_mail_user_cb:-?\d+$"))
+    application.add_handler(CallbackQueryHandler(link_mail_user_cb, pattern="^link_mail_user_cb:-?\d+$"))
     application.add_handler(CallbackQueryHandler(handle_fh, pattern="^fh$"))
     application.add_handler(CallbackQueryHandler(handle_fs, pattern="^fs$"))
     application.add_handler(CallbackQueryHandler(handle_fr, pattern="^fr$"))
@@ -1187,10 +1198,6 @@ if __name__ == "__main__":
         )
     )
 
-    # Broadcast handlers:
-    # 1) plain text /send <message>
-    application.add_handler(CommandHandler("send", broadcast_from_admin))
-    # 2) media with caption starting `/send`
     media_send_filter = filters.Chat(ADMIN_CHAT_ID) & filters.CaptionRegex(r"^/send")
     application.add_handler(MessageHandler(media_send_filter, broadcast_from_admin))
 
