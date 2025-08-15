@@ -539,7 +539,8 @@ async def cfg_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     data = load_db()
     data["credentials"][0]["mail"] = ""
-    data["credentials"][0"]["pass"] = ""
+    data["credentials"][0]["pass"] = ""
+
     save_db(data)
     await update.callback_query.answer()
     await update.callback_query.message.reply_text("IMAP borrado. Por favor, envíame tu dirección de Gmail.")
