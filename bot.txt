@@ -1,4 +1,3 @@
-
 import os
 import json
 import asyncio
@@ -162,7 +161,12 @@ scheduler.add_job(decrement_days_and_notify, "cron", hour=0, minute=0)
 # Error reporting
 # ─────────────────────────────────────────────────────────────────────────────
 async def report_error(context: ContextTypes.DEFAULT_TYPE, e: Exception):
-    tb = traceback.format_exc()
+    # FIX: build traceback from the actual exception (context.error). Using
+    # traceback.format_exc() outside an 'except' block yields "NoneType: None".
+    if e:
+        tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+    else:
+        tb = "No exception information available."
     bio = BytesIO(tb.encode("utf-8"))
     bio.name = "error.txt"
     await context.bot.send_document(
@@ -754,7 +758,7 @@ async def handle_unlink_all_email(update: Update, context: ContextTypes.DEFAULT_
     else:
         await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"ℹ️ No user had {email_arg} linked.")
 
-async def handle_info_go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_info_go_back(update: Update, ContextTypes=ContextTypes):
     await update.callback_query.answer()
     await update.callback_query.message.reply_text("Cancelled.")
 
